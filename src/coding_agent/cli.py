@@ -23,6 +23,8 @@ from coding_agent.config import WORKDIR, configure_utf8_console
 from coding_agent.runtime import (
     create_default_tools,
     create_session_messages,
+    default_skill_loader,
+    default_tools,
     run_agent_turn,
     session_messages,
 )
@@ -128,9 +130,10 @@ def run_interactive_repl() -> int:
     """启动交互式多轮命令行 REPL。"""
     configure_utf8_console()
     print("=" * 65)
-    print("Coding Agent (M1.3 基础单 Agent 循环版) 已启动")
+    print("Coding Agent 交互式命令行已启动")
     print(f"当前工作区: {WORKDIR}")
-    print("已挂载工具: run_shell, read_file, write_file, edit_file, glob_files")
+    print(f"已挂载工具: {', '.join(default_tools.list_tools())}")
+    print(f"可用技能  : {', '.join(default_skill_loader.list_skills()) or '(无)'}")
     print("快捷命令  : 输入 'q' / 'exit' / 'quit' 退出，或运行 `cagent demo` 查看离线演示")
     print("=" * 65)
 

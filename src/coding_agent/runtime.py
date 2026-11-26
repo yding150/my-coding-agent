@@ -1,25 +1,24 @@
 """
-runtime.py - Coding Agent 单 Agent 主循环驱动引擎（已集成 M2.1 Hook 生命周期切面）
+runtime.py - Coding Agent 单 Agent 主循环驱动引擎（已集成 M2.1 Hook 切面 + M2.2 按需技能）
 
 架构角色：
-    连接“大模型大脑 (`coding_agent.llm`)”、“本地工具手脚 (`coding_agent.tools`)”与
-    “生命周期切面门禁 (`coding_agent.hooks`)”的核心驱动引擎，在经典的 ReAct / Tool-Calling
-    `while True` 闭环之上提供 `UserPromptSubmit` / `PreToolUse` / `PostToolUse` / `Stop`
-    四个可插拔切面挂载点，确保高危命令经过 HITL 审批门禁后才可真正执行。
+    连接“大模型大脑 (`coding_agent.llm`)”、“本地工具手脚 (`coding_agent.tools`)”、
+    “生命周期切面门禁 (`coding_agent.hooks`)”与“按需专业技能 (`coding_agent.skills`)”的核心驱动引擎。
+    在 `while True` 工具闭环之上，既支持 `PreToolUse` / `PostToolUse` / `UserPromptSubmit` / `Stop`
+    切面拦截，又通过两层提示词机制在 System Prompt 注入轻量技能目录并按需加载 `SKILL.md`。
 
 解决的核心痛点：
     1. 将大模型纯文本对话升级为“思考 -> 切面审批/执行工具 -> 观察真实输出 -> 总结回复”的多轮闭环；
-    2. 通过 `execute_tool()` 将 `PreToolUse` 危险指令拒绝理由安全转译为 `tool` 消息回填给模型，
-       防止主循环崩溃并引导模型改用安全方案；
-    3. 严格遵守 OpenAI `assistant(tool_calls)` 与 `tool(tool_call_id)` 的消息配对协议；
-    4. 通过 `MAX_AGENT_TURNS` 轮次上限熔断，防止模型连续空转调用工具造成死循环。
+    2. 通过 `SkillLoader` 两层加载机制在不撑爆 System Prompt 的前提下赋予 Agent 领域专家技能；
+    3. 通过 `execute_tool()` 将 `PreToolUse` 危险指令拒绝理由安全转译为 `tool` 消息回填给模型；
+    4. 严格遵守 OpenAI `assistant(tool_calls)` 与 `tool(tool_call_id)` 的消息配对协议，并受 `MAX_AGENT_TURNS` 保护。
 
 暴露的核心接口：
-    - `build_system_prompt`: 生成绑定当前工作区的系统提示词
-    - `create_default_tools` / `create_default_hooks`: 创建默认工具集与默认切面管理器
+    - `build_system_prompt`: 生成绑定工作区与轻量技能目录的系统提示词
+    - `create_default_tools` / `create_default_hooks`: 创建默认工具集（含 `load_skill`）与默认切面管理器
     - `execute_tool`: 经由 `PreToolUse` / `PostToolUse` 切面包装的安全工具执行函数
     - `run_agent_turn`: 执行单次用户提问驱动的多轮工具调用闭环
-    - `create_session_messages` / `session_messages`: 会话上下文容器
+    - `create_session_messages` / `session_messages` / `default_skill_loader`: 会话上下文与技能加载器
 """
 
 from __future__ import annotations
@@ -28,45 +27,63 @@ import json
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
-from coding_agent.config import MAX_AGENT_TURNS, WORKDIR, configure_utf8_console
+from coding_agent.config import MAX_AGENT_TURNS, SKILLS_DIR, WORKDIR, configure_utf8_console
 from coding_agent.hooks import HookEvent, HookManager, register_default_hooks
 from coding_agent.llm import call_llm
+from coding_agent.skills import SkillLoader, register_skill_tools
 from coding_agent.tools import ToolManager, register_core_tools
 
 configure_utf8_console()
 
-# 默认会话上下文、默认工具管理器与默认生命周期钩子（M1~M2 保持简单直观，P2 再收拢为 AgentSession）
+# 默认技能加载器、工具管理器、生命周期钩子与会话上下文（M1~M2 保持直观，P2 再收拢为 AgentSession）
+default_skill_loader: SkillLoader = SkillLoader(SKILLS_DIR)
 session_messages: List[Dict[str, Any]] = []
-default_tools: ToolManager = register_core_tools(ToolManager(), workdir=WORKDIR)
-default_hooks: HookManager = register_default_hooks(HookManager())
 
 
-def build_system_prompt(workdir: Optional[Path] = None) -> str:
+def build_system_prompt(
+    workdir: Optional[Path] = None,
+    skill_loader: Optional[SkillLoader] = None,
+) -> str:
     """
-    构建最小单 Agent 系统提示词（System Prompt）。
+    构建包含工作区约束与第一层轻量技能目录的系统提示词（System Prompt）。
 
     :param workdir: 当前绑定的沙箱工作区路径，默认使用 `WORKDIR`。
-    :return: 告知模型角色、工作区位置与工具使用原则的系统提示词文本。
+    :param skill_loader: 技能加载器实例，默认使用 `default_skill_loader`。
+    :return: 告知模型角色、工作区位置、可用技能目录与工具使用原则的系统提示词文本。
     """
     base = (workdir or WORKDIR).resolve()
+    active_loader = skill_loader if skill_loader is not None else default_skill_loader
     return (
         f"你是一个位于工作区 {base} 的务实 Coding Agent（编程助手）。\n"
-        f"你可以使用内置工具读写文件、搜索目录和执行命令行指令来解决用户的工程问题。\n\n"
+        f"你可以使用内置工具读写文件、搜索目录、执行命令行指令以及按需加载专业技能来解决用户的工程问题。\n\n"
+        f"【可用专业技能目录（轻量元数据）】：\n"
+        f"{active_loader.catalog()}\n\n"
         f"【基本工作准则】：\n"
         f"1. 行动优先：查看文件、列目录、修改代码或验证结果时，直接调用工具获取真实信息，不要凭空猜测；\n"
-        f"2. 路径约束：所有文件操作均相对于工作区 {base} 进行；\n"
-        f"3. 实事求是：若工具返回报错，请根据错误信息调整参数重试，并在最终回答中如实汇报结果。"
+        f"2. 按需加载技能：若任务命中上方某项专业技能领域，请先调用 `load_skill` 读取完整操作规范后再执行；\n"
+        f"3. 路径约束：所有文件操作均相对于工作区 {base} 进行；\n"
+        f"4. 实事求是：若工具返回报错，请根据错误信息调整参数重试，并在最终回答中如实汇报结果。"
     )
 
 
-def create_default_tools(workdir: Optional[Path] = None) -> ToolManager:
-    """创建并装配好 5 大核心工具的 `ToolManager` 实例（便于测试或隔离会话使用）。"""
-    return register_core_tools(ToolManager(), workdir=workdir or WORKDIR)
+def create_default_tools(
+    workdir: Optional[Path] = None,
+    skill_loader: Optional[SkillLoader] = None,
+) -> ToolManager:
+    """创建并装配好 5 大核心工具与 `load_skill` 技能工具的 `ToolManager` 实例。"""
+    manager = register_core_tools(ToolManager(), workdir=workdir or WORKDIR)
+    active_loader = skill_loader if skill_loader is not None else default_skill_loader
+    register_skill_tools(manager, active_loader)
+    return manager
 
 
 def create_default_hooks(auto_approve: bool = False) -> HookManager:
     """创建并装配好默认生命周期钩子链（审计日志 + 危险指令门禁 + 超长输出警告 + 会话统计）。"""
     return register_default_hooks(HookManager(), auto_approve=auto_approve)
+
+
+default_tools: ToolManager = create_default_tools(workdir=WORKDIR, skill_loader=default_skill_loader)
+default_hooks: HookManager = create_default_hooks()
 
 
 def execute_tool(
@@ -94,9 +111,12 @@ def execute_tool(
     return str(output)
 
 
-def create_session_messages(workdir: Optional[Path] = None) -> List[Dict[str, Any]]:
-    """初始化一条仅包含 `system` 提示词的新对话历史列表。"""
-    return [{"role": "system", "content": build_system_prompt(workdir=workdir)}]
+def create_session_messages(
+    workdir: Optional[Path] = None,
+    skill_loader: Optional[SkillLoader] = None,
+) -> List[Dict[str, Any]]:
+    """初始化一条仅包含 `system` 提示词（含轻量技能目录）的新对话历史列表。"""
+    return [{"role": "system", "content": build_system_prompt(workdir=workdir, skill_loader=skill_loader)}]
 
 
 def _get_attr_or_key(obj: Any, name: str, default: Any = None) -> Any:
@@ -177,14 +197,15 @@ def run_agent_turn(
     messages: Optional[List[Dict[str, Any]]] = None,
     llm_caller: Callable[..., Any] = call_llm,
     workdir: Optional[Path] = None,
+    skill_loader: Optional[SkillLoader] = None,
     max_turns: Optional[int] = None,
     verbose: bool = True,
 ) -> str:
     """
-    执行一次用户输入触发的单 Agent 闭环（核心 `while True` 工具循环 + Hook 切面）。
+    执行一次用户输入触发的单 Agent 闭环（核心 `while True` 工具循环 + Hook 切面 + 按需技能）。
 
     运行流程：
-        1. 确保会话顶部存在 `system` 提示词，触发 `UserPromptSubmit` 切面并追加 `user` 消息；
+        1. 确保会话顶部存在 `system` 提示词（含轻量技能目录），触发 `UserPromptSubmit` 切面并追加 `user` 消息；
         2. 循环调用大模型（携带 `tools.get_schemas()`）；
         3. 若模型**未发起** `tool_calls`，触发 `Stop` 切面（若 `Stop` 返回强行续轮指令则注入并继续，
            否则返回最终文本）；
@@ -198,6 +219,7 @@ def run_agent_turn(
     :param messages: 对话消息列表（原地追加更新），默认使用模块级 `session_messages`。
     :param llm_caller: 模型调用函数（默认 `call_llm`，测试或 Demo 可传入 Mock 函数）。
     :param workdir: 工作区根目录（仅在初始化首条 system 消息时生效）。
+    :param skill_loader: 可选技能加载器（用于初始化首条 system 消息中的轻量技能目录）。
     :param max_turns: 单次用户提问最多允许的模型调用轮数，默认取 `MAX_AGENT_TURNS`。
     :param verbose: 是否向终端打印工具调用与助手回答过程。
     :return: 模型最终输出的回复文本（若超限则返回提示文本）。
@@ -207,9 +229,12 @@ def run_agent_turn(
     active_messages = messages if messages is not None else session_messages
     turn_limit = max_turns if max_turns is not None else MAX_AGENT_TURNS
 
-    # 1. 确保上下文第 0 条始终是 system prompt（避免首次对话缺少行为约束）
+    # 1. 确保上下文第 0 条始终是 system prompt（避免首次对话缺少行为约束与可用技能目录）
     if not active_messages or active_messages[0].get("role") != "system":
-        active_messages.insert(0, {"role": "system", "content": build_system_prompt(workdir=workdir)})
+        active_messages.insert(
+            0,
+            {"role": "system", "content": build_system_prompt(workdir=workdir, skill_loader=skill_loader)},
+        )
 
     # 2. 触发 UserPromptSubmit 前置切面并记录用户输入
     active_hooks.trigger(HookEvent.USER_PROMPT_SUBMIT, prompt)

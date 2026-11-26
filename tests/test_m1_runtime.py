@@ -52,7 +52,10 @@ class TestM1RuntimeLoop(unittest.TestCase):
         def fake_llm(messages, tools):
             self.assertEqual(messages[0]["role"], "system")
             self.assertEqual(messages[-1], {"role": "user", "content": "你好"})
-            self.assertEqual(len(tools), 5)
+            tool_names = {t["function"]["name"] for t in tools}
+            self.assertTrue(
+                {"run_shell", "read_file", "write_file", "edit_file", "glob_files"}.issubset(tool_names)
+            )
             return _fake_msg(content="你好，我可以帮你读写代码。")
 
         reply = runtime_mod.run_agent_turn(
