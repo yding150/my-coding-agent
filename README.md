@@ -36,8 +36,8 @@ Copy-Item .env.example .env
 ### Phase 1：基础底座逐模块增量迁移（M1 ~ M9，细分为 24 个子步骤）
 - **M1：配置底座 + LLM + 核心工具**
   - [x] **M1.1**：配置底座 + LLM 适配层（`config.py`, `llm/client.py`）
-  - [ ] **M1.2**：工具注册分发表 + 5 大核心工具（`tools/manager.py`, `tools/core_tools.py`）
-  - [ ] **M1.3**：最小单 Agent 主循环 + CLI 入口（`runtime.py`, `cli.py`）
+  - [x] **M1.2**：工具注册分发表 + 5 大核心工具（`tools/manager.py`, `tools/core_tools.py`）
+  - [x] **M1.3**：最小单 Agent 主循环 + CLI 入口（`runtime.py`, `cli.py`）
 - **M2：切面钩子 + 按需技能 + 会话级 Todo**
   - [ ] **M2.1**：生命周期切面钩子与审批门禁（`hooks/`）
   - [ ] **M2.2**：按需技能加载器 + 迁入内置技能资产（`skills/` + 根目录 `skills/`）

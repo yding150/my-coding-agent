@@ -1,6 +1,35 @@
 """
-coding_agent.tools - 统一工具管理与核心工具集（Phase 0 空占位，计划于里程碑 M1/M2 迁入）。
+coding_agent.tools - 统一工具管理与核心基础工具库
 
-规划组件：
-    `ToolManager`、`register_core_tools`（文件读写编辑、目录匹配、Shell 执行）及工具注册分发表。
+当前阶段（M1.2）暴露：
+    - 工具管理器：`ToolManager`, `ToolDefinition`
+    - 5 大核心工具与装配器：`CORE_SCHEMAS`, `register_core_tools`,
+      `run_shell`, `read_file`, `write_file`, `edit_file`, `glob_files`, `_safe_path`
+
+注：`todo_tools` 将于里程碑 M2.3 按增量规划迁入。
 """
+
+from coding_agent.tools.core_tools import (
+    CORE_SCHEMAS,
+    _safe_path,
+    edit_file,
+    glob_files,
+    read_file,
+    register_core_tools,
+    run_shell,
+    write_file,
+)
+from coding_agent.tools.manager import ToolDefinition, ToolManager
+
+__all__ = [
+    "ToolManager",
+    "ToolDefinition",
+    "CORE_SCHEMAS",
+    "register_core_tools",
+    "run_shell",
+    "read_file",
+    "write_file",
+    "edit_file",
+    "glob_files",
+    "_safe_path",
+]

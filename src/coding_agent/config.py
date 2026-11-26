@@ -7,8 +7,6 @@ config.py - 统一路径与环境配置底座模块
     并统一加载 `.env` 环境变量与运行时开关参数。
 
 解决的核心痛点：
-    原教学代码（`_legacy_ref/s17_goal_loop.py`）将 `.tasks`、`.memory`、`.transcripts`、
-    `.mailboxes`、`.workflows` 等十余个隐藏目录直接散落在工作区根目录。
     本模块将所有运行态持久化与临时目录收拢到 `<WORKDIR>/.agent/` 下，避免污染业务代码仓库，
     同时通过 `build_agent_paths(workdir)` 支持测试隔离与未来会话实例化扩展。
 
