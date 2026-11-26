@@ -1,20 +1,23 @@
 """
-runtime.py - Coding Agent 最小单 Agent 主循环驱动引擎（M1.3 基础底座）
+runtime.py - Coding Agent 单 Agent 主循环驱动引擎（已集成 M2.1 Hook 生命周期切面）
 
 架构角色：
-    连接“大模型大脑 (`coding_agent.llm`)”与“本地工具手脚 (`coding_agent.tools`)”的核心驱动引擎，
-    实现经典的 ReAct / Tool-Calling `while True` 单 Agent 闭环（对应原教学项目 `s02` 能力）。
-    后续 M2 ~ M9 的切面钩子、技能、上下文压缩、长期记忆、子代理、后台任务、团队协同、
-    MCP 与 Goal Stop Hook 都将在此循环基础上逐层挂载。
+    连接“大模型大脑 (`coding_agent.llm`)”、“本地工具手脚 (`coding_agent.tools`)”与
+    “生命周期切面门禁 (`coding_agent.hooks`)”的核心驱动引擎，在经典的 ReAct / Tool-Calling
+    `while True` 闭环之上提供 `UserPromptSubmit` / `PreToolUse` / `PostToolUse` / `Stop`
+    四个可插拔切面挂载点，确保高危命令经过 HITL 审批门禁后才可真正执行。
 
 解决的核心痛点：
-    1. 将大模型纯文本对话升级为“思考 -> 调用工具 -> 观察真实输出 -> 纠错/继续 -> 总结回复”的多轮闭环；
-    2. 严格遵守 OpenAI `assistant(tool_calls)` 与 `tool(tool_call_id)` 的消息配对协议；
-    3. 通过 `MAX_AGENT_TURNS` 轮次上限熔断，防止模型连续空转调用工具造成死循环或高额 Token 消耗。
+    1. 将大模型纯文本对话升级为“思考 -> 切面审批/执行工具 -> 观察真实输出 -> 总结回复”的多轮闭环；
+    2. 通过 `execute_tool()` 将 `PreToolUse` 危险指令拒绝理由安全转译为 `tool` 消息回填给模型，
+       防止主循环崩溃并引导模型改用安全方案；
+    3. 严格遵守 OpenAI `assistant(tool_calls)` 与 `tool(tool_call_id)` 的消息配对协议；
+    4. 通过 `MAX_AGENT_TURNS` 轮次上限熔断，防止模型连续空转调用工具造成死循环。
 
 暴露的核心接口：
     - `build_system_prompt`: 生成绑定当前工作区的系统提示词
-    - `create_default_tools`: 创建并挂载 5 大核心工具的 `ToolManager`
+    - `create_default_tools` / `create_default_hooks`: 创建默认工具集与默认切面管理器
+    - `execute_tool`: 经由 `PreToolUse` / `PostToolUse` 切面包装的安全工具执行函数
     - `run_agent_turn`: 执行单次用户提问驱动的多轮工具调用闭环
     - `create_session_messages` / `session_messages`: 会话上下文容器
 """
@@ -26,14 +29,16 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from coding_agent.config import MAX_AGENT_TURNS, WORKDIR, configure_utf8_console
+from coding_agent.hooks import HookEvent, HookManager, register_default_hooks
 from coding_agent.llm import call_llm
 from coding_agent.tools import ToolManager, register_core_tools
 
 configure_utf8_console()
 
-# 默认会话上下文与默认工具管理器（供交互式 REPL 直接复用；M1 阶段保持简单直观，P2 再抽离为 AgentSession）
+# 默认会话上下文、默认工具管理器与默认生命周期钩子（M1~M2 保持简单直观，P2 再收拢为 AgentSession）
 session_messages: List[Dict[str, Any]] = []
 default_tools: ToolManager = register_core_tools(ToolManager(), workdir=WORKDIR)
+default_hooks: HookManager = register_default_hooks(HookManager())
 
 
 def build_system_prompt(workdir: Optional[Path] = None) -> str:
@@ -57,6 +62,36 @@ def build_system_prompt(workdir: Optional[Path] = None) -> str:
 def create_default_tools(workdir: Optional[Path] = None) -> ToolManager:
     """创建并装配好 5 大核心工具的 `ToolManager` 实例（便于测试或隔离会话使用）。"""
     return register_core_tools(ToolManager(), workdir=workdir or WORKDIR)
+
+
+def create_default_hooks(auto_approve: bool = False) -> HookManager:
+    """创建并装配好默认生命周期钩子链（审计日志 + 危险指令门禁 + 超长输出警告 + 会话统计）。"""
+    return register_default_hooks(HookManager(), auto_approve=auto_approve)
+
+
+def execute_tool(
+    fn_name: str,
+    args: Dict[str, Any],
+    tool_mgr: ToolManager,
+    hook_mgr: Optional[HookManager] = None,
+) -> str:
+    """
+    经由 `PreToolUse` 与 `PostToolUse` 生命周期切面包装的统一工具执行器。
+
+    :param fn_name: 待调用的工具名。
+    :param args: 解析后的工具参数字典。
+    :param tool_mgr: 目标工具管理器。
+    :param hook_mgr: 生命周期钩子管理器；默认使用全局 `default_hooks`。
+    :return: 工具真实输出或被前置切面拦截的拒绝原因文本。
+    """
+    active_hooks = hook_mgr if hook_mgr is not None else default_hooks
+    blocked_reason = active_hooks.trigger(HookEvent.PRE_TOOL_USE, fn_name, args)
+    if blocked_reason is not None:
+        return f"操作被钩子拦截拒绝: {blocked_reason}"
+
+    output = tool_mgr.execute(fn_name, args)
+    active_hooks.trigger(HookEvent.POST_TOOL_USE, fn_name, args, output)
+    return str(output)
 
 
 def create_session_messages(workdir: Optional[Path] = None) -> List[Dict[str, Any]]:
@@ -138,6 +173,7 @@ def run_agent_turn(
     prompt: str,
     *,
     tools: Optional[ToolManager] = None,
+    hooks: Optional[HookManager] = None,
     messages: Optional[List[Dict[str, Any]]] = None,
     llm_caller: Callable[..., Any] = call_llm,
     workdir: Optional[Path] = None,
@@ -145,18 +181,20 @@ def run_agent_turn(
     verbose: bool = True,
 ) -> str:
     """
-    执行一次用户输入触发的单 Agent 闭环（核心 `while True` 工具循环）。
+    执行一次用户输入触发的单 Agent 闭环（核心 `while True` 工具循环 + Hook 切面）。
 
     运行流程：
-        1. 确保会话顶部存在 `system` 提示词，并追加本次 `user` 消息；
+        1. 确保会话顶部存在 `system` 提示词，触发 `UserPromptSubmit` 切面并追加 `user` 消息；
         2. 循环调用大模型（携带 `tools.get_schemas()`）；
-        3. 若模型**未发起** `tool_calls`，说明它认为已经完成任务，输出并直接返回最终文本；
-        4. 若模型**发起了** `tool_calls`，依次解析参数、通过 `tools.execute()` 执行本地工具，
-           并把每条执行结果封装为 `role="tool"` 消息（带匹配 `tool_call_id`）回填进 `messages`；
-        5. 回到步骤 2 让模型“看见”工具结果，直到它给出最终回复或触发 `max_turns` 上限保护。
+        3. 若模型**未发起** `tool_calls`，触发 `Stop` 切面（若 `Stop` 返回强行续轮指令则注入并继续，
+           否则返回最终文本）；
+        4. 若模型**发起了** `tool_calls`，通过 `execute_tool()` 依次经历 `PreToolUse`（含危险指令
+           HITL 审批）、本地执行与 `PostToolUse`，再按 `tool_call_id` 配对回填 `role="tool"`；
+        5. 回到步骤 2 让模型“看见”工具结果，直到给出最终回复或触发 `max_turns` 上限保护。
 
     :param prompt: 用户本轮输入的自然语言指令。
     :param tools: 工具管理器，默认使用绑定 `WORKDIR` 的 `default_tools`。
+    :param hooks: 生命周期钩子管理器，默认使用 `default_hooks`。
     :param messages: 对话消息列表（原地追加更新），默认使用模块级 `session_messages`。
     :param llm_caller: 模型调用函数（默认 `call_llm`，测试或 Demo 可传入 Mock 函数）。
     :param workdir: 工作区根目录（仅在初始化首条 system 消息时生效）。
@@ -165,6 +203,7 @@ def run_agent_turn(
     :return: 模型最终输出的回复文本（若超限则返回提示文本）。
     """
     active_tools = tools if tools is not None else default_tools
+    active_hooks = hooks if hooks is not None else default_hooks
     active_messages = messages if messages is not None else session_messages
     turn_limit = max_turns if max_turns is not None else MAX_AGENT_TURNS
 
@@ -172,7 +211,8 @@ def run_agent_turn(
     if not active_messages or active_messages[0].get("role") != "system":
         active_messages.insert(0, {"role": "system", "content": build_system_prompt(workdir=workdir)})
 
-    # 2. 记录本轮用户输入；若调用大模型前或首轮调用即抛异常，由调用方决定是否回滚
+    # 2. 触发 UserPromptSubmit 前置切面并记录用户输入
+    active_hooks.trigger(HookEvent.USER_PROMPT_SUBMIT, prompt)
     active_messages.append({"role": "user", "content": prompt})
 
     turns_count = 0
@@ -183,6 +223,7 @@ def run_agent_turn(
             limit_msg = f"⚠️ 已达到单次调用最大轮数限制 (MAX_TURNS={turn_limit})，强制结束本轮并交还控制权。"
             if verbose:
                 print(f"\n{limit_msg}")
+            active_hooks.trigger(HookEvent.STOP, active_messages)
             return limit_msg
 
         # 3. 携带当前工具的 OpenAI Schema 调用大模型
@@ -195,14 +236,20 @@ def run_agent_turn(
 
         tool_calls = assistant_dict.get("tool_calls") or []
 
-        # 5. 退出条件：模型没有发起任何 tool_calls，表示本轮推理结束，直接返回文本回复
+        # 5. 退出条件：模型没有发起任何 tool_calls，触发 Stop 切面裁决后结束或续轮
         if not tool_calls:
             final_text = str(assistant_dict.get("content") or "")
             if verbose and final_text:
                 print(f"\n助手回答:\n{final_text}")
+
+            force_continue = active_hooks.trigger(HookEvent.STOP, active_messages)
+            if force_continue:
+                # Why: 允许 Stop 切面通过返回非 None 提示文本阻止模型提前结束（为 M9 Goal 闭环预留接口）
+                active_messages.append({"role": "user", "content": str(force_continue)})
+                continue
             return final_text
 
-        # 6. 执行模型请求的每一个工具，并严格按 tool_call_id 配对回填 role="tool" 消息
+        # 6. 经过 PreToolUse / PostToolUse 切面执行每个工具，并按 tool_call_id 配对回填 role="tool"
         for tc in tool_calls:
             fn_name = tc["function"]["name"]
             raw_args = tc["function"]["arguments"]
@@ -217,7 +264,7 @@ def run_agent_turn(
             else:
                 if verbose:
                     print(f"\n[调用工具]: {fn_name}({parsed_args})")
-                tool_output = active_tools.execute(fn_name, parsed_args)
+                tool_output = execute_tool(fn_name, parsed_args, active_tools, hook_mgr=active_hooks)
 
             if verbose:
                 preview = tool_output[:400] + ("..." if len(tool_output) > 400 else "")
