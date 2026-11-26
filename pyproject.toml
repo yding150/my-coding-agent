@@ -1,0 +1,40 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "my-coding-agent"
+version = "0.1.0"
+description = "工业级个人 Coding Agent 运行时底座（基于 learn-claude-code s01~s17 增量演进）"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "openai>=3.42.0",
+    "python-dotenv>=1.0.0",
+    "pyyaml>=6.0.3",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+]
+
+[project.scripts]
+# CLI 主入口（将于 M1 起步、M9 完整收敛）
+coding-agent = "coding_agent.cli:main"
+cagent = "coding_agent.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/coding_agent"]
+
+[tool.pytest.ini_options]
+# 仅将 src 纳入测试导入路径，与 _legacy_ref 彻底解耦
+pythonpath = ["src"]
+# 按模块在 tests/ 下放置并收集单元测试
+testpaths = ["tests"]
+norecursedirs = ["_legacy_ref", ".venv", ".agent", ".idea", "docs", "skills"]
