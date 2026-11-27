@@ -1,21 +1,23 @@
 """
-runtime.py - Coding Agent 单 Agent 主循环驱动引擎（已集成 M2 Hook/Skill/Todo + M3.1 Context 压缩）
+runtime.py - Coding Agent 单 Agent 主循环驱动引擎（已集成 M2 Hook/Skill/Todo + M3.1 Context + M3.2 Memory）
 
 架构角色：
     连接“大模型大脑 (`coding_agent.llm`)”、“本地工具手脚 (`coding_agent.tools`)”、
     “生命周期切面门禁 (`coding_agent.hooks`)”、“按需专业技能 (`coding_agent.skills`)”、
-    “会话待办清单 (`coding_agent.tasks`)”与“四步上下文压缩 (`coding_agent.context`)”的核心驱动引擎。
+    “会话待办清单 (`coding_agent.tasks`)”、“四步上下文压缩 (`coding_agent.context`)”
+    与“跨会话持久记忆 (`coding_agent.memory`)”的核心驱动引擎。
 
 解决的核心痛点：
     1. 将大模型纯文本对话升级为“思考 -> 切面审批/执行工具 -> 观察真实输出 -> 总结回复”的多轮闭环；
     2. 通过 `SkillLoader` 两层加载机制在不撑爆 System Prompt 的前提下赋予 Agent 领域专家技能；
     3. 通过 `todo_write` 整表覆盖待办清单与 `rounds_since_planning` 守卫提醒对抗长链条思维漂移；
     4. 通过 `ContextCompactor` 四步压缩与 `reactive_compact` 防止上下文超限崩溃，支持 `compact` 主动归档至 `.agent/transcripts/`；
-    5. 严格遵守 OpenAI `assistant(tool_calls)` 与 `tool(tool_call_id)` 的消息配对协议，并受 `MAX_AGENT_TURNS` 保护。
+    5. 通过 `MemoryManager` 在会话启动前按需召回 `.agent/memory/` 历史偏好并在结束时提炼落盘；
+    6. 严格遵守 OpenAI `assistant(tool_calls)` 与 `tool(tool_call_id)` 的消息配对协议，并受 `MAX_AGENT_TURNS` 保护。
 
 暴露的核心接口：
-    - `build_system_prompt`: 生成绑定工作区、轻量技能目录、上下文规则与规划指引的系统提示词
-    - `create_default_tools` / `create_default_hooks` / `create_default_compactor`
+    - `build_system_prompt`: 生成绑定工作区、轻量技能目录、上下文规则、规划指引与召回记忆的系统提示词
+    - `create_default_tools` / `create_default_hooks` / `create_default_compactor` / `create_default_memory_manager`
     - `execute_tool`: 经由 `PreToolUse` / `PostToolUse` 切面包装的安全工具执行函数
     - `run_agent_turn`: 执行单次用户提问驱动的多轮工具调用闭环
     - `create_session_messages` / `session_messages` / `default_*`
@@ -29,6 +31,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from coding_agent.config import (
     MAX_AGENT_TURNS,
+    MEMORY_DIR,
     SKILLS_DIR,
     TOOL_RESULTS_DIR,
     TRANSCRIPT_DIR,
@@ -38,16 +41,18 @@ from coding_agent.config import (
 from coding_agent.context import ContextCompactor
 from coding_agent.hooks import HookEvent, HookManager, register_default_hooks
 from coding_agent.llm import call_llm
+from coding_agent.memory import MemoryManager
 from coding_agent.skills import SkillLoader, register_skill_tools
 from coding_agent.tasks import TodoManager, register_todo_tools
 from coding_agent.tools import ToolManager, register_core_tools
 
 configure_utf8_console()
 
-# 默认技能加载器、会话 Todo 管理器、上下文压缩器、连续未规划计数器与会话上下文（P2 再收拢为 AgentSession）
+# 默认技能加载器、会话 Todo 管理器、上下文压缩器、跨会话记忆管理器与会话上下文（P2 再收拢为 AgentSession）
 default_skill_loader: SkillLoader = SkillLoader(SKILLS_DIR)
 default_todo_mgr: TodoManager = TodoManager()
 default_compactor: ContextCompactor = ContextCompactor(TRANSCRIPT_DIR, TOOL_RESULTS_DIR)
+default_memory_mgr: MemoryManager = MemoryManager(MEMORY_DIR, workdir=WORKDIR)
 session_messages: List[Dict[str, Any]] = []
 rounds_since_planning: int = 0
 PLANNING_GUARD_THRESHOLD: int = 5
@@ -57,29 +62,42 @@ PLANNING_TOOLS: tuple[str, ...] = ("todo_write",)
 def build_system_prompt(
     workdir: Optional[Path] = None,
     skill_loader: Optional[SkillLoader] = None,
+    relevant_memories: str = "",
 ) -> str:
     """
-    构建包含工作区约束、第一层轻量技能目录、上下文压缩与规划规范的系统提示词（System Prompt）。
+    构建包含工作区约束、第一层轻量技能目录、规划规范、压缩说明与历史相关记忆的系统提示词。
 
     :param workdir: 当前绑定的沙箱工作区路径，默认使用 `WORKDIR`。
     :param skill_loader: 技能加载器实例，默认使用 `default_skill_loader`。
-    :return: 告知模型角色、工作区位置、可用技能目录与工具使用原则的系统提示词文本。
+    :param relevant_memories: 本轮按需召回的相关跨会话记忆 JSON 字符串（空串时不追加段落）。
+    :return: 完整的系统提示词文本。
     """
     base = (workdir or WORKDIR).resolve()
     active_loader = skill_loader if skill_loader is not None else default_skill_loader
-    return (
-        f"你是一个位于工作区 {base} 的务实 Coding Agent（编程助手）。\n"
-        f"你可以使用内置工具读写文件、搜索目录、执行命令行指令、维护待办清单、压缩长上下文以及按需加载专业技能来解决用户的工程问题。\n\n"
-        f"【可用专业技能目录（轻量元数据）】：\n"
-        f"{active_loader.catalog()}\n\n"
-        f"【基本工作准则】：\n"
-        f"1. 行动优先：查看文件、列目录、修改代码或验证结果时，直接调用工具获取真实信息，不要凭空猜测；\n"
-        f"2. 规划防漂移：面对多步骤复杂任务，使用 `todo_write` 维护当前会话待办清单，保持焦点不偏离目标；\n"
-        f"3. 按需加载技能：若任务命中上方某项专业技能领域，请先调用 `load_skill` 读取完整操作规范后再执行；\n"
-        f"4. 上下文管理：遇到包含 `[Compacted]` 或 `[Emergency Compact]` 的历史压缩通知时，专注当前最新目标；上下文过长时可调用 `compact` 归档历史；\n"
-        f"5. 路径约束：所有文件操作均相对于工作区 {base} 进行；\n"
-        f"6. 实事求是：若工具返回报错，请根据错误信息调整参数重试，并在最终回答中如实汇报结果。"
-    )
+    sections = [
+        (
+            f"你是一个位于工作区 {base} 的务实 Coding Agent（编程助手）。\n"
+            f"你可以使用内置工具读写文件、搜索目录、执行命令行指令、维护待办清单、压缩长上下文以及按需加载专业技能来解决用户的工程问题。\n\n"
+            f"【可用专业技能目录（轻量元数据）】：\n"
+            f"{active_loader.catalog()}\n\n"
+            f"【基本工作准则】：\n"
+            f"1. 行动优先：查看文件、列目录、修改代码或验证结果时，直接调用工具获取真实信息，不要凭空猜测；\n"
+            f"2. 规划防漂移：面对多步骤复杂任务，使用 `todo_write` 维护当前会话待办清单，保持焦点不偏离目标；\n"
+            f"3. 按需加载技能：若任务命中上方某项专业技能领域，请先调用 `load_skill` 读取完整操作规范后再执行；\n"
+            f"4. 上下文管理：遇到包含 `[Compacted]` 或 `[Emergency Compact]` 的历史压缩通知时，专注当前最新目标；上下文过长时可调用 `compact` 归档历史；\n"
+            f"5. 路径约束：所有文件操作均相对于工作区 {base} 进行；\n"
+            f"6. 实事求是：若工具返回报错，请根据错误信息调整参数重试，并在最终回答中如实汇报结果。"
+        )
+    ]
+
+    if relevant_memories:
+        sections.append(
+            "【历史跨会话记忆（自动激活）】：\n"
+            "以下是与当前任务高度相关的历史知识与用户偏好，请优先遵循：\n"
+            f"{relevant_memories}"
+        )
+
+    return "\n\n".join(sections)
 
 
 def create_default_compactor(
@@ -90,6 +108,20 @@ def create_default_compactor(
     return ContextCompactor(
         transcript_dir=transcript_dir or TRANSCRIPT_DIR,
         tool_results_dir=tool_results_dir or TOOL_RESULTS_DIR,
+    )
+
+
+def create_default_memory_manager(
+    memory_dir: Optional[Path] = None,
+    workdir: Optional[Path] = None,
+    llm_caller: Optional[Callable[..., Any]] = None,
+) -> MemoryManager:
+    """创建绑定 `.agent/memory` 的 `MemoryManager` 实例。"""
+    base = (workdir or WORKDIR).resolve()
+    return MemoryManager(
+        memory_dir=memory_dir or MEMORY_DIR,
+        workdir=base,
+        llm_caller=llm_caller,
     )
 
 
@@ -243,33 +275,36 @@ def run_agent_turn(
     skill_loader: Optional[SkillLoader] = None,
     todo_mgr: Optional[TodoManager] = None,
     compactor: Optional[ContextCompactor] = None,
+    memory_mgr: Optional[MemoryManager] = None,
     planning_state: Optional[Dict[str, int]] = None,
     max_turns: Optional[int] = None,
     verbose: bool = True,
 ) -> str:
     """
-    执行一次用户输入触发的单 Agent 闭环（核心 `while True` 工具循环 + Hook + Skill + Todo + Context 压缩）。
+    执行一次用户输入触发的单 Agent 闭环（核心 `while True` 工具循环 + Hook + Skill + Todo + Context + Memory）。
 
     运行流程：
-        1. 确保会话顶部存在 `system` 提示词（含轻量技能目录），触发 `UserPromptSubmit` 切面并追加 `user` 消息；
-        2. 每次调用大模型前执行 `ContextCompactor.prepare()` 四步压缩管线；
-        3. 调用大模型（携带 `tools.get_schemas()`），若触发上下文超长异常则执行 `reactive_compact` 应急自愈重试；
-        4. 若模型**未发起** `tool_calls`，触发 `Stop` 切面（若 `Stop` 返回强行续轮指令则注入并继续，
-           否则返回最终文本）；
-        5. 若模型**发起了** `tool_calls`，通过 `execute_tool()` 依次经历 `PreToolUse`、`PostToolUse`，
+        1. 触发 `UserPromptSubmit` 切面并追加 `user` 消息；
+        2. 会话启动前按需召回跨会话记忆并刷新顶部 `system` 提示词；
+        3. 每次调用大模型前执行 `ContextCompactor.prepare()` 四步压缩管线；
+        4. 调用大模型（携带 `tools.get_schemas()`），遇上下文超长异常则执行 `reactive_compact` 自愈重试；
+        5. 若模型**未发起** `tool_calls`，触发 `Stop` 切面（若 `Stop` 返回强行续轮指令则注入并继续，
+           否则提炼/整理跨会话记忆并返回最终文本）；
+        6. 若模型**发起了** `tool_calls`，通过 `execute_tool()` 依次经历 `PreToolUse`、`PostToolUse`，
            按 `tool_call_id` 配对回填 `role="tool"`；
-        6. 执行连续未规划守卫（`rounds_since_planning >= 5`）以及主动 `compact` 归档裁剪；
-        7. 回到步骤 2 让模型“看见”工具结果，直到给出最终回复或触发 `max_turns` 上限保护。
+        7. 执行连续未规划守卫（`rounds_since_planning >= 5`）以及主动 `compact` 归档裁剪；
+        8. 回到步骤 3 让模型“看见”工具结果，直到给出最终回复或触发 `max_turns` 上限保护。
 
     :param prompt: 用户本轮输入的自然语言指令。
     :param tools: 工具管理器，默认使用绑定 `WORKDIR` 的 `default_tools`。
     :param hooks: 生命周期钩子管理器，默认使用 `default_hooks`。
     :param messages: 对话消息列表（原地追加更新），默认使用模块级 `session_messages`。
     :param llm_caller: 模型调用函数（默认 `call_llm`，测试或 Demo 可传入 Mock 函数）。
-    :param workdir: 工作区根目录（仅在初始化首条 system 消息时生效）。
-    :param skill_loader: 可选技能加载器（用于初始化首条 system 消息中的轻量技能目录）。
+    :param workdir: 工作区根目录（用于生成或刷新 system 消息）。
+    :param skill_loader: 可选技能加载器（用于生成或刷新 system 消息中的轻量技能目录）。
     :param todo_mgr: 可选外部 Todo 管理器（仅作语义标注；若需绑定工具请通过 `create_default_tools(..., todo_mgr=...)` 传入）。
     :param compactor: 可选上下文压缩器；默认使用绑定 `.agent/` 目录的 `default_compactor`。
+    :param memory_mgr: 可选跨会话记忆管理器；使用默认 `call_llm` 时默认启用 `default_memory_mgr`。
     :param planning_state: 可选的连续未规划计数字典 `{"rounds_since_planning": int}`；
         传入自定义 `messages` 时默认隔离新建，未传 `messages` 时默认使用模块级计数器。
     :param max_turns: 单次用户提问最多允许的模型调用轮数，默认取 `MAX_AGENT_TURNS`。
@@ -283,6 +318,16 @@ def run_agent_turn(
     active_tools = tools if tools is not None else default_tools
     active_hooks = hooks if hooks is not None else default_hooks
     active_compactor = compactor if compactor is not None else default_compactor
+    # Why: 当外部传入自定义 Mock llm_caller（离线单测或 Demo）且未显式传入 memory_mgr 时，
+    # 跳过默认记忆管理器，防止离线测试向真实大模型发起网络请求或写入当前仓库 .agent/memory/。
+    active_memory: Optional[MemoryManager]
+    if memory_mgr is not None:
+        active_memory = memory_mgr
+    elif llm_caller is call_llm:
+        active_memory = default_memory_mgr
+    else:
+        active_memory = None
+
     use_default_session = messages is None
     active_messages = messages if messages is not None else session_messages
     turn_limit = max_turns if max_turns is not None else MAX_AGENT_TURNS
@@ -296,16 +341,21 @@ def run_agent_turn(
     else:
         local_planning = {"rounds_since_planning": 0}
 
-    # 1. 确保上下文第 0 条始终是 system prompt（避免首次对话缺少行为约束与可用技能目录）
-    if not active_messages or active_messages[0].get("role") != "system":
-        active_messages.insert(
-            0,
-            {"role": "system", "content": build_system_prompt(workdir=workdir, skill_loader=skill_loader)},
-        )
-
-    # 2. 触发 UserPromptSubmit 前置切面并记录用户输入
+    # 1. 触发 UserPromptSubmit 前置切面并追加本轮用户输入
     active_hooks.trigger(HookEvent.USER_PROMPT_SUBMIT, prompt)
     active_messages.append({"role": "user", "content": prompt})
+
+    # 2. 会话前相关记忆召回并刷新第 0 条 system 提示词（此时消息列表已含最新 user 提问，便于按需检索）
+    relevant_memories = active_memory.load_memories(active_messages) if active_memory is not None else ""
+    refreshed_system = build_system_prompt(
+        workdir=workdir,
+        skill_loader=skill_loader,
+        relevant_memories=relevant_memories,
+    )
+    if active_messages and active_messages[0].get("role") == "system":
+        active_messages[0]["content"] = refreshed_system
+    else:
+        active_messages.insert(0, {"role": "system", "content": refreshed_system})
 
     turns_count = 0
     try:
@@ -358,6 +408,10 @@ def run_agent_turn(
                     # Why: 允许 Stop 切面通过返回非 None 提示文本阻止模型提前结束（为 M9 Goal 闭环预留接口）
                     active_messages.append({"role": "user", "content": str(force_continue)})
                     continue
+
+                if active_memory is not None:
+                    if active_memory.extract_memories(active_messages):
+                        active_memory.consolidate_memories()
                 return final_text
 
             # 7. 经过 PreToolUse / PostToolUse 切面执行每个工具，并按 tool_call_id 配对回填 role="tool"
