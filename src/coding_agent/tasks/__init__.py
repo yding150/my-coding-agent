@@ -1,7 +1,20 @@
 """
-coding_agent.tasks - 双轨计划系统（Phase 0 空占位，计划于里程碑 M2/M4 迁入）。
+coding_agent.tasks - 双轨计划系统
 
-规划组件：
-    - 第一轨（M2）：`TodoManager` 会话级轻量内存待办清单（`todo_write`）；
-    - 第二轨（M4）：`TaskStore` 跨会话持久 DAG 任务依赖图（`create_task` 等 6 个工具）。
+当前阶段（M2.3）已迁入第一轨：
+    - `TodoManager`, `TODO_TOOL_SCHEMA`, `register_todo_tools`（会话级轻量内存待办清单）
+
+注：第二轨跨会话持久 DAG 任务图（`TaskStore`、`register_task_tools`）将于 M4.2 迁入。
 """
+
+from coding_agent.tasks.todo import (
+    TODO_TOOL_SCHEMA,
+    TodoManager,
+    register_todo_tools,
+)
+
+__all__ = [
+    "TODO_TOOL_SCHEMA",
+    "TodoManager",
+    "register_todo_tools",
+]

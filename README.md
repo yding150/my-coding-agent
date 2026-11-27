@@ -41,7 +41,7 @@ Copy-Item .env.example .env
 - **M2：切面钩子 + 按需技能 + 会话级 Todo（每步均接入 `runtime.py`）**
   - [x] **M2.1**：生命周期切面钩子与审批门禁 + 主循环集成（`hooks/`, `runtime.py`）
   - [x] **M2.2**：按需技能加载器 + 迁入技能资产 + 主循环集成（`skills/`, 根目录 `skills/`, `runtime.py`）
-  - [ ] **M2.3**：会话级 Todo 清单 + 主循环计划守卫集成（`tasks/todo.py`, `tools/todo_tools.py`, `runtime.py`）
+  - [x] **M2.3**：会话级 Todo 清单 + 主循环计划守卫集成（`tasks/todo.py`, `tools/todo_tools.py`, `runtime.py`）
 - **M3：上下文四步压缩 + 跨会话记忆（每步均接入 `runtime.py`）**
   - [ ] **M3.1**：四步上下文压缩管线 + 主循环集成（`context/compactor.py`, `runtime.py`）
   - [ ] **M3.2**：跨会话长期记忆存储 + 主循环集成（`memory/store.py`, `runtime.py`）
