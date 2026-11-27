@@ -1,6 +1,13 @@
 """
-coding_agent.context - 四步上下文压缩管线（Phase 0 空占位，计划于里程碑 M3 迁入）。
+coding_agent.context - 上下文四步压缩管线与转录归档
 
-规划组件：
-    `ContextCompactor`（实现 Micro / Snip / Reactive / Auto 四步分层压缩与转录归档）。
+在里程碑 M3.1 中迁入，暴露：
+    - `ContextCompactor`: 提供 Layer 1 (`tool_result_budget`)、Layer 2 (`snip_compact`)、
+      Layer 3 (`micro_compact`)、Layer 4 (`compact_history`) 与应急自愈 (`reactive_compact`)
 """
+
+from coding_agent.context.compactor import ContextCompactor
+
+__all__ = [
+    "ContextCompactor",
+]

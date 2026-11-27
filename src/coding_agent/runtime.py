@@ -1,24 +1,24 @@
 """
-runtime.py - Coding Agent 单 Agent 主循环驱动引擎（已集成 M2.1 Hook + M2.2 Skill + M2.3 Todo）
+runtime.py - Coding Agent 单 Agent 主循环驱动引擎（已集成 M2 Hook/Skill/Todo + M3.1 Context 压缩）
 
 架构角色：
     连接“大模型大脑 (`coding_agent.llm`)”、“本地工具手脚 (`coding_agent.tools`)”、
-    “生命周期切面门禁 (`coding_agent.hooks`)”、“按需专业技能 (`coding_agent.skills`)”
-    与“会话待办清单 (`coding_agent.tasks`)”的核心驱动引擎。
+    “生命周期切面门禁 (`coding_agent.hooks`)”、“按需专业技能 (`coding_agent.skills`)”、
+    “会话待办清单 (`coding_agent.tasks`)”与“四步上下文压缩 (`coding_agent.context`)”的核心驱动引擎。
 
 解决的核心痛点：
     1. 将大模型纯文本对话升级为“思考 -> 切面审批/执行工具 -> 观察真实输出 -> 总结回复”的多轮闭环；
     2. 通过 `SkillLoader` 两层加载机制在不撑爆 System Prompt 的前提下赋予 Agent 领域专家技能；
     3. 通过 `todo_write` 整表覆盖待办清单与 `rounds_since_planning` 守卫提醒对抗长链条思维漂移；
-    4. 通过 `execute_tool()` 将 `PreToolUse` 危险指令拒绝理由安全转译为 `tool` 消息回填给模型；
+    4. 通过 `ContextCompactor` 四步压缩与 `reactive_compact` 防止上下文超限崩溃，支持 `compact` 主动归档至 `.agent/transcripts/`；
     5. 严格遵守 OpenAI `assistant(tool_calls)` 与 `tool(tool_call_id)` 的消息配对协议，并受 `MAX_AGENT_TURNS` 保护。
 
 暴露的核心接口：
-    - `build_system_prompt`: 生成绑定工作区、轻量技能目录与规划指引的系统提示词
-    - `create_default_tools` / `create_default_hooks`: 创建默认工具集（含 `load_skill`、`todo_write`）与默认切面管理器
+    - `build_system_prompt`: 生成绑定工作区、轻量技能目录、上下文规则与规划指引的系统提示词
+    - `create_default_tools` / `create_default_hooks` / `create_default_compactor`
     - `execute_tool`: 经由 `PreToolUse` / `PostToolUse` 切面包装的安全工具执行函数
-    - `run_agent_turn`: 执行单次用户提问驱动的多轮工具调用闭环（含连续未规划守卫）
-    - `create_session_messages` / `session_messages` / `default_skill_loader` / `default_todo_mgr`
+    - `run_agent_turn`: 执行单次用户提问驱动的多轮工具调用闭环
+    - `create_session_messages` / `session_messages` / `default_*`
 """
 
 from __future__ import annotations
@@ -27,7 +27,15 @@ import json
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
-from coding_agent.config import MAX_AGENT_TURNS, SKILLS_DIR, WORKDIR, configure_utf8_console
+from coding_agent.config import (
+    MAX_AGENT_TURNS,
+    SKILLS_DIR,
+    TOOL_RESULTS_DIR,
+    TRANSCRIPT_DIR,
+    WORKDIR,
+    configure_utf8_console,
+)
+from coding_agent.context import ContextCompactor
 from coding_agent.hooks import HookEvent, HookManager, register_default_hooks
 from coding_agent.llm import call_llm
 from coding_agent.skills import SkillLoader, register_skill_tools
@@ -36,9 +44,10 @@ from coding_agent.tools import ToolManager, register_core_tools
 
 configure_utf8_console()
 
-# 默认技能加载器、会话 Todo 管理器、连续未规划计数器与会话上下文（P2 再收拢为 AgentSession）
+# 默认技能加载器、会话 Todo 管理器、上下文压缩器、连续未规划计数器与会话上下文（P2 再收拢为 AgentSession）
 default_skill_loader: SkillLoader = SkillLoader(SKILLS_DIR)
 default_todo_mgr: TodoManager = TodoManager()
+default_compactor: ContextCompactor = ContextCompactor(TRANSCRIPT_DIR, TOOL_RESULTS_DIR)
 session_messages: List[Dict[str, Any]] = []
 rounds_since_planning: int = 0
 PLANNING_GUARD_THRESHOLD: int = 5
@@ -50,7 +59,7 @@ def build_system_prompt(
     skill_loader: Optional[SkillLoader] = None,
 ) -> str:
     """
-    构建包含工作区约束、第一层轻量技能目录与规划规范的系统提示词（System Prompt）。
+    构建包含工作区约束、第一层轻量技能目录、上下文压缩与规划规范的系统提示词（System Prompt）。
 
     :param workdir: 当前绑定的沙箱工作区路径，默认使用 `WORKDIR`。
     :param skill_loader: 技能加载器实例，默认使用 `default_skill_loader`。
@@ -60,15 +69,27 @@ def build_system_prompt(
     active_loader = skill_loader if skill_loader is not None else default_skill_loader
     return (
         f"你是一个位于工作区 {base} 的务实 Coding Agent（编程助手）。\n"
-        f"你可以使用内置工具读写文件、搜索目录、执行命令行指令、维护待办清单以及按需加载专业技能来解决用户的工程问题。\n\n"
+        f"你可以使用内置工具读写文件、搜索目录、执行命令行指令、维护待办清单、压缩长上下文以及按需加载专业技能来解决用户的工程问题。\n\n"
         f"【可用专业技能目录（轻量元数据）】：\n"
         f"{active_loader.catalog()}\n\n"
         f"【基本工作准则】：\n"
         f"1. 行动优先：查看文件、列目录、修改代码或验证结果时，直接调用工具获取真实信息，不要凭空猜测；\n"
         f"2. 规划防漂移：面对多步骤复杂任务，使用 `todo_write` 维护当前会话待办清单，保持焦点不偏离目标；\n"
         f"3. 按需加载技能：若任务命中上方某项专业技能领域，请先调用 `load_skill` 读取完整操作规范后再执行；\n"
-        f"4. 路径约束：所有文件操作均相对于工作区 {base} 进行；\n"
-        f"5. 实事求是：若工具返回报错，请根据错误信息调整参数重试，并在最终回答中如实汇报结果。"
+        f"4. 上下文管理：遇到包含 `[Compacted]` 或 `[Emergency Compact]` 的历史压缩通知时，专注当前最新目标；上下文过长时可调用 `compact` 归档历史；\n"
+        f"5. 路径约束：所有文件操作均相对于工作区 {base} 进行；\n"
+        f"6. 实事求是：若工具返回报错，请根据错误信息调整参数重试，并在最终回答中如实汇报结果。"
+    )
+
+
+def create_default_compactor(
+    transcript_dir: Optional[Path] = None,
+    tool_results_dir: Optional[Path] = None,
+) -> ContextCompactor:
+    """创建绑定 `.agent/transcripts` 与 `.agent/tool-results` 的 `ContextCompactor` 实例。"""
+    return ContextCompactor(
+        transcript_dir=transcript_dir or TRANSCRIPT_DIR,
+        tool_results_dir=tool_results_dir or TOOL_RESULTS_DIR,
     )
 
 
@@ -77,12 +98,21 @@ def create_default_tools(
     skill_loader: Optional[SkillLoader] = None,
     todo_mgr: Optional[TodoManager] = None,
 ) -> ToolManager:
-    """创建并装配好 5 大核心工具、`load_skill` 与 `todo_write` 的 `ToolManager` 实例。"""
+    """创建并装配好 5 大核心工具、`load_skill`、`todo_write` 与 `compact` 的 `ToolManager` 实例。"""
     manager = register_core_tools(ToolManager(), workdir=workdir or WORKDIR)
     active_loader = skill_loader if skill_loader is not None else default_skill_loader
     active_todo = todo_mgr if todo_mgr is not None else default_todo_mgr
     register_skill_tools(manager, active_loader)
     register_todo_tools(manager, active_todo)
+
+    @manager.register(
+        name="compact",
+        description="主动触发上下文压缩归档。将过往对话转存至 .agent/transcripts/ 转录文件，并裁剪冗余历史。",
+        parameters={"type": "object", "properties": {}},
+    )
+    def run_compact() -> str:
+        return "已收到压缩请求。当前轮次工具执行完毕后，系统将立即触发上下文历史归档与裁剪！"
+
     return manager
 
 
@@ -212,22 +242,24 @@ def run_agent_turn(
     workdir: Optional[Path] = None,
     skill_loader: Optional[SkillLoader] = None,
     todo_mgr: Optional[TodoManager] = None,
+    compactor: Optional[ContextCompactor] = None,
     planning_state: Optional[Dict[str, int]] = None,
     max_turns: Optional[int] = None,
     verbose: bool = True,
 ) -> str:
     """
-    执行一次用户输入触发的单 Agent 闭环（核心 `while True` 工具循环 + Hook + Skill + Todo）。
+    执行一次用户输入触发的单 Agent 闭环（核心 `while True` 工具循环 + Hook + Skill + Todo + Context 压缩）。
 
     运行流程：
         1. 确保会话顶部存在 `system` 提示词（含轻量技能目录），触发 `UserPromptSubmit` 切面并追加 `user` 消息；
-        2. 循环调用大模型（携带 `tools.get_schemas()`）；
-        3. 若模型**未发起** `tool_calls`，触发 `Stop` 切面（若 `Stop` 返回强行续轮指令则注入并继续，
+        2. 每次调用大模型前执行 `ContextCompactor.prepare()` 四步压缩管线；
+        3. 调用大模型（携带 `tools.get_schemas()`），若触发上下文超长异常则执行 `reactive_compact` 应急自愈重试；
+        4. 若模型**未发起** `tool_calls`，触发 `Stop` 切面（若 `Stop` 返回强行续轮指令则注入并继续，
            否则返回最终文本）；
-        4. 若模型**发起了** `tool_calls`，通过 `execute_tool()` 依次经历 `PreToolUse`（含危险指令
-           HITL 审批）、本地执行与 `PostToolUse`，再按 `tool_call_id` 配对回填 `role="tool"`；
-        5. 每轮统计是否调用了规划工具（`todo_write` 等），连续 5 轮未规划则自动注入守卫提示；
-        6. 回到步骤 2 让模型“看见”工具结果，直到给出最终回复或触发 `max_turns` 上限保护。
+        5. 若模型**发起了** `tool_calls`，通过 `execute_tool()` 依次经历 `PreToolUse`、`PostToolUse`，
+           按 `tool_call_id` 配对回填 `role="tool"`；
+        6. 执行连续未规划守卫（`rounds_since_planning >= 5`）以及主动 `compact` 归档裁剪；
+        7. 回到步骤 2 让模型“看见”工具结果，直到给出最终回复或触发 `max_turns` 上限保护。
 
     :param prompt: 用户本轮输入的自然语言指令。
     :param tools: 工具管理器，默认使用绑定 `WORKDIR` 的 `default_tools`。
@@ -237,6 +269,7 @@ def run_agent_turn(
     :param workdir: 工作区根目录（仅在初始化首条 system 消息时生效）。
     :param skill_loader: 可选技能加载器（用于初始化首条 system 消息中的轻量技能目录）。
     :param todo_mgr: 可选外部 Todo 管理器（仅作语义标注；若需绑定工具请通过 `create_default_tools(..., todo_mgr=...)` 传入）。
+    :param compactor: 可选上下文压缩器；默认使用绑定 `.agent/` 目录的 `default_compactor`。
     :param planning_state: 可选的连续未规划计数字典 `{"rounds_since_planning": int}`；
         传入自定义 `messages` 时默认隔离新建，未传 `messages` 时默认使用模块级计数器。
     :param max_turns: 单次用户提问最多允许的模型调用轮数，默认取 `MAX_AGENT_TURNS`。
@@ -249,9 +282,11 @@ def run_agent_turn(
     _ = todo_mgr
     active_tools = tools if tools is not None else default_tools
     active_hooks = hooks if hooks is not None else default_hooks
+    active_compactor = compactor if compactor is not None else default_compactor
     use_default_session = messages is None
     active_messages = messages if messages is not None else session_messages
     turn_limit = max_turns if max_turns is not None else MAX_AGENT_TURNS
+    active_user_request = prompt
 
     # Why: 当使用默认全局 REPL 会话时延续跨轮次计数器；当测试传入隔离 messages 时使用独立计数器避免串扰
     if planning_state is not None:
@@ -284,17 +319,35 @@ def run_agent_turn(
                 active_hooks.trigger(HookEvent.STOP, active_messages)
                 return limit_msg
 
-            # 3. 携带当前工具的 OpenAI Schema 调用大模型
-            schemas = active_tools.get_schemas()
-            response_msg = llm_caller(messages=active_messages, tools=schemas)
+            # 3. 执行四步上下文压缩管线（使用切片原地替换，确保调用方持有的列表引用同步更新）
+            prepared = active_compactor.prepare(active_messages, active_request=active_user_request)
+            if prepared is not active_messages:
+                active_messages[:] = prepared
 
-            # 4. 无论模型是否调用工具，都必须先把这条 assistant 消息追加进对话历史
+            # 4. 携带当前工具的 OpenAI Schema 调用大模型，遇上下文超长时触发响应式应急压缩重试
+            schemas = active_tools.get_schemas()
+            try:
+                response_msg = llm_caller(messages=active_messages, tools=schemas)
+            except Exception as exc:
+                err_text = str(exc).lower()
+                if any(k in err_text for k in ("prompt_too_long", "context_length_exceeded", "too many tokens")):
+                    rebuilt = active_compactor.reactive_compact(
+                        active_messages,
+                        active_request=active_user_request,
+                    )
+                    if rebuilt is not active_messages:
+                        active_messages[:] = rebuilt
+                    response_msg = llm_caller(messages=active_messages, tools=schemas)
+                else:
+                    raise
+
+            # 5. 无论模型是否调用工具，都必须先把这条 assistant 消息追加进对话历史
             assistant_dict = _assistant_message_to_dict(response_msg)
             active_messages.append(assistant_dict)
 
             tool_calls = assistant_dict.get("tool_calls") or []
 
-            # 5. 退出条件：模型没有发起任何 tool_calls，触发 Stop 切面裁决后结束或续轮
+            # 6. 退出条件：模型没有发起任何 tool_calls，触发 Stop 切面裁决后结束或续轮
             if not tool_calls:
                 final_text = str(assistant_dict.get("content") or "")
                 if verbose and final_text:
@@ -307,8 +360,9 @@ def run_agent_turn(
                     continue
                 return final_text
 
-            # 6. 经过 PreToolUse / PostToolUse 切面执行每个工具，并按 tool_call_id 配对回填 role="tool"
+            # 7. 经过 PreToolUse / PostToolUse 切面执行每个工具，并按 tool_call_id 配对回填 role="tool"
             used_planning_in_this_round = False
+            compact_requested = False
 
             for tc in tool_calls:
                 fn_name = tc["function"]["name"]
@@ -317,6 +371,8 @@ def run_agent_turn(
 
                 if fn_name in PLANNING_TOOLS:
                     used_planning_in_this_round = True
+                if fn_name == "compact":
+                    compact_requested = True
 
                 if parse_err is not None:
                     # Why: 即使 JSON 解析失败，也必须回填一条对应的 role="tool" 消息，
@@ -341,7 +397,7 @@ def run_agent_turn(
                     }
                 )
 
-            # 7. 连续未更新计划守卫：一旦连续 5 轮工具调用均未规划，注入轻量纠偏提醒并清零计数
+            # 8. 连续未更新计划守卫：一旦连续 5 轮工具调用均未规划，注入轻量纠偏提醒并清零计数
             if used_planning_in_this_round:
                 local_planning["rounds_since_planning"] = 0
             else:
@@ -349,11 +405,22 @@ def run_agent_turn(
 
             if local_planning["rounds_since_planning"] >= PLANNING_GUARD_THRESHOLD:
                 nudge = (
-                    "[系统守卫提示]: 您已经连续 5 轮未更新任务计划。"
+                    f"[系统守卫提示]: 您已经连续 {PLANNING_GUARD_THRESHOLD} 轮未更新任务计划。"
                     "请使用 todo_write 梳理或更新当前会话待办步骤，防止长链条执行偏离目标。"
                 )
                 active_messages.append({"role": "user", "content": nudge})
                 local_planning["rounds_since_planning"] = 0
+
+            # 9. 若模型主动调用了 compact 工具，在本轮工具回填后立即执行历史归档与裁剪
+            if compact_requested:
+                if verbose:
+                    print("\n🧹 [Context 压缩] 主动压缩生效，正在执行会话历史归档与裁剪...")
+                rebuilt = active_compactor.reactive_compact(
+                    active_messages,
+                    active_request=active_user_request,
+                )
+                if rebuilt is not active_messages:
+                    active_messages[:] = rebuilt
     finally:
         if use_default_session and planning_state is None:
             rounds_since_planning = local_planning["rounds_since_planning"]

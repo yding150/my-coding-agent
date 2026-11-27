@@ -43,7 +43,7 @@ Copy-Item .env.example .env
   - [x] **M2.2**：按需技能加载器 + 迁入技能资产 + 主循环集成（`skills/`, 根目录 `skills/`, `runtime.py`）
   - [x] **M2.3**：会话级 Todo 清单 + 主循环计划守卫集成（`tasks/todo.py`, `tools/todo_tools.py`, `runtime.py`）
 - **M3：上下文四步压缩 + 跨会话记忆（每步均接入 `runtime.py`）**
-  - [ ] **M3.1**：四步上下文压缩管线 + 主循环集成（`context/compactor.py`, `runtime.py`）
+  - [x] **M3.1**：四步上下文压缩管线 + 主循环集成（`context/compactor.py`, `runtime.py`）
   - [ ] **M3.2**：跨会话长期记忆存储 + 主循环集成（`memory/store.py`, `runtime.py`）
 - **M4：一次性隔离子代理 + 持久 DAG 任务图（每步均接入 `runtime.py`）**
   - [ ] **M4.1**：一次性隔离子代理 + 主循环集成（`subagent/`, `runtime.py`）
