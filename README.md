@@ -46,8 +46,8 @@ Copy-Item .env.example .env
   - [x] **M3.1**：四步上下文压缩管线 + 主循环集成（`context/compactor.py`, `runtime.py`）
   - [x] **M3.2**：跨会话长期记忆存储 + 主循环集成（`memory/store.py`, `runtime.py`）
 - **M4：一次性隔离子代理 + 持久 DAG 任务图（每步均接入 `runtime.py`）**
-  - [ ] **M4.1**：一次性隔离子代理 + 主循环集成（`subagent/`, `runtime.py`）
-  - [ ] **M4.2**：持久 DAG 任务依赖图 + 主循环集成（`tasks/store.py`, `runtime.py`）
+  - [x] **M4.1**：一次性隔离子代理 + 主循环集成（`subagent/`, `runtime.py`）
+  - [x] **M4.2**：持久 DAG 任务依赖图 + 主循环集成（`tasks/store.py`, `runtime.py`）
 - **M5：异步后台任务 + Cron 定时调度（每步均接入 `runtime.py`）**
   - [ ] **M5.1**：异步后台任务管理与增强 Shell + 主循环集成（`background/`, `runtime.py`）
   - [ ] **M5.2**：Cron 定时调度引擎 + 并发唤醒线程集成（`cron/`, `runtime.py`, `cli.py`）

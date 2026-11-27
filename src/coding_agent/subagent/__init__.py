@@ -1,6 +1,17 @@
 """
-coding_agent.subagent - 一次性隔离子代理执行器（Phase 0 空占位，计划于里程碑 M4 迁入）。
+coding_agent.subagent - 一次性隔离子代理模块（Ephemeral Subagent）
 
-规划组件：
-    `SubagentRunner`、`register_subagent_tools`（提供防递归隔离上下文的 `task` 委派能力）。
+在里程碑 M4.1 中迁入，暴露：
+    - `FORBIDDEN_SUBAGENT_TOOLS`: 防递归剥离工具名单
+    - `SubagentRunner`: 独立干净上下文的同步子代理运行器
+    - `register_subagent_tools`: 向父级 `ToolManager` 挂载 `task` 工具
 """
+
+from coding_agent.subagent.runner import FORBIDDEN_SUBAGENT_TOOLS, SubagentRunner
+from coding_agent.subagent.tools import register_subagent_tools
+
+__all__ = [
+    "FORBIDDEN_SUBAGENT_TOOLS",
+    "SubagentRunner",
+    "register_subagent_tools",
+]

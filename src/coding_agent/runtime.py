@@ -1,23 +1,25 @@
 """
-runtime.py - Coding Agent 单 Agent 主循环驱动引擎（已集成 M2 Hook/Skill/Todo + M3.1 Context + M3.2 Memory）
+runtime.py - Coding Agent 单 Agent 主循环驱动引擎（已集成 M2~M4.2 Hook/Skill/Todo/Context/Memory/Subagent/DAG Tasks）
 
 架构角色：
     连接“大模型大脑 (`coding_agent.llm`)”、“本地工具手脚 (`coding_agent.tools`)”、
     “生命周期切面门禁 (`coding_agent.hooks`)”、“按需专业技能 (`coding_agent.skills`)”、
-    “会话待办清单 (`coding_agent.tasks`)”、“四步上下文压缩 (`coding_agent.context`)”
-    与“跨会话持久记忆 (`coding_agent.memory`)”的核心驱动引擎。
+    “双轨计划系统 (`coding_agent.tasks`: 会话 Todo + 持久 DAG 任务图)”、“四步上下文压缩 (`coding_agent.context`)”、
+    “跨会话持久记忆 (`coding_agent.memory`)”与“一次性隔离子代理 (`coding_agent.subagent`)”的核心驱动引擎。
 
 解决的核心痛点：
     1. 将大模型纯文本对话升级为“思考 -> 切面审批/执行工具 -> 观察真实输出 -> 总结回复”的多轮闭环；
     2. 通过 `SkillLoader` 两层加载机制在不撑爆 System Prompt 的前提下赋予 Agent 领域专家技能；
-    3. 通过 `todo_write` 整表覆盖待办清单与 `rounds_since_planning` 守卫提醒对抗长链条思维漂移；
+    3. 通过双轨计划（`todo_write` 内存清单 + `.agent/tasks/` 持久 DAG 任务依赖图）与 `rounds_since_planning` 守卫对抗长链条思维漂移；
     4. 通过 `ContextCompactor` 四步压缩与 `reactive_compact` 防止上下文超限崩溃，支持 `compact` 主动归档至 `.agent/transcripts/`；
     5. 通过 `MemoryManager` 在会话启动前按需召回 `.agent/memory/` 历史偏好并在结束时提炼落盘；
-    6. 严格遵守 OpenAI `assistant(tool_calls)` 与 `tool(tool_call_id)` 的消息配对协议，并受 `MAX_AGENT_TURNS` 保护。
+    6. 通过 `shared_tools` / `parent_tools` 工具分层与 `SubagentRunner`，让主代理经 `task` 外包探索且隔离上下文噪音、杜绝递归套娃；
+    7. 严格遵守 OpenAI `assistant(tool_calls)` 与 `tool(tool_call_id)` 的消息配对协议，并受 `MAX_AGENT_TURNS` 保护。
 
 暴露的核心接口：
-    - `build_system_prompt`: 生成绑定工作区、轻量技能目录、上下文规则、规划指引与召回记忆的系统提示词
-    - `create_default_tools` / `create_default_hooks` / `create_default_compactor` / `create_default_memory_manager`
+    - `build_system_prompt`: 生成绑定工作区、轻量技能目录、双轨计划分工、上下文规则与召回记忆的系统提示词
+    - `create_shared_tools` / `create_default_subagent_runner` / `create_default_task_store` / `create_default_tools` / `create_default_hooks` / `create_default_compactor` / `create_default_memory_manager`
+    - `shared_tools` / `parent_tools` / `default_tools` / `default_subagent_runner` / `default_task_store`
     - `execute_tool`: 经由 `PreToolUse` / `PostToolUse` 切面包装的安全工具执行函数
     - `run_agent_turn`: 执行单次用户提问驱动的多轮工具调用闭环
     - `create_session_messages` / `session_messages` / `default_*`
@@ -25,7 +27,6 @@ runtime.py - Coding Agent 单 Agent 主循环驱动引擎（已集成 M2 Hook/Sk
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
@@ -33,30 +34,47 @@ from coding_agent.config import (
     MAX_AGENT_TURNS,
     MEMORY_DIR,
     SKILLS_DIR,
+    TASKS_DIR,
     TOOL_RESULTS_DIR,
     TRANSCRIPT_DIR,
     WORKDIR,
+    build_agent_paths,
     configure_utf8_console,
 )
 from coding_agent.context import ContextCompactor
 from coding_agent.hooks import HookEvent, HookManager, register_default_hooks
-from coding_agent.llm import call_llm
+from coding_agent.llm import assistant_message_to_dict, call_llm, parse_tool_arguments
 from coding_agent.memory import MemoryManager
 from coding_agent.skills import SkillLoader, register_skill_tools
-from coding_agent.tasks import TodoManager, register_todo_tools
+from coding_agent.subagent import SubagentRunner, register_subagent_tools
+from coding_agent.tasks import (
+    TaskStore,
+    TodoManager,
+    register_task_tools,
+    register_todo_tools,
+)
 from coding_agent.tools import ToolManager, register_core_tools
 
 configure_utf8_console()
 
-# 默认技能加载器、会话 Todo 管理器、上下文压缩器、跨会话记忆管理器与会话上下文（P2 再收拢为 AgentSession）
+# 默认技能加载器、双轨计划管理器（Todo + TaskStore）、上下文压缩器、跨会话记忆管理器与会话上下文（P2 再收拢为 AgentSession）
 default_skill_loader: SkillLoader = SkillLoader(SKILLS_DIR)
 default_todo_mgr: TodoManager = TodoManager()
+default_task_store: TaskStore = TaskStore(TASKS_DIR, workdir=WORKDIR)
 default_compactor: ContextCompactor = ContextCompactor(TRANSCRIPT_DIR, TOOL_RESULTS_DIR)
 default_memory_mgr: MemoryManager = MemoryManager(MEMORY_DIR, workdir=WORKDIR)
 session_messages: List[Dict[str, Any]] = []
 rounds_since_planning: int = 0
 PLANNING_GUARD_THRESHOLD: int = 5
-PLANNING_TOOLS: tuple[str, ...] = ("todo_write",)
+# 规划与任务分解类工具（调用 Todo、持久 DAG 任务图或委派 Subagent 均视为主动推进计划，清零守卫计数）
+PLANNING_TOOLS: tuple[str, ...] = (
+    "todo_write",
+    "task",
+    "create_task",
+    "update_task",
+    "claim_task",
+    "complete_task",
+)
 
 
 def build_system_prompt(
@@ -77,16 +95,20 @@ def build_system_prompt(
     sections = [
         (
             f"你是一个位于工作区 {base} 的务实 Coding Agent（编程助手）。\n"
-            f"你可以使用内置工具读写文件、搜索目录、执行命令行指令、维护待办清单、压缩长上下文以及按需加载专业技能来解决用户的工程问题。\n\n"
+            f"你可以使用内置工具读写文件、搜索目录、执行命令行指令、维护双轨计划（会话待办与持久 DAG 任务图）、压缩长上下文、按需加载专业技能，并通过 `task` 委派一次性隔离子代理来解决用户的工程问题。\n\n"
             f"【可用专业技能目录（轻量元数据）】：\n"
             f"{active_loader.catalog()}\n\n"
+            f"【双轨计划分工规范 (Two-Tier Planning Rules)】：\n"
+            f"1. 计划第一轨·轻量会话待办（`todo_write`）：纯内存整表覆盖更新，适合当前会话内 3~8 步短期步骤跟踪，防止长工具链思维漂移；\n"
+            f"2. 计划第二轨·持久 DAG 任务图（`create_task` / `update_task` / `list_tasks` / `get_task` / `claim_task` / `complete_task`）：持久化保存于 `.agent/tasks/`，适合多阶段依赖编排与跨会话断点恢复；必须严格走两阶段建图——先 `create_task` 获取真实 `task_xxxxxxxx` ID，再 `update_task(task_id, addBlockedBy)` 建立依赖边，随后 `claim_task` 认领与 `complete_task` 完成解锁下游。\n\n"
             f"【基本工作准则】：\n"
             f"1. 行动优先：查看文件、列目录、修改代码或验证结果时，直接调用工具获取真实信息，不要凭空猜测；\n"
-            f"2. 规划防漂移：面对多步骤复杂任务，使用 `todo_write` 维护当前会话待办清单，保持焦点不偏离目标；\n"
-            f"3. 按需加载技能：若任务命中上方某项专业技能领域，请先调用 `load_skill` 读取完整操作规范后再执行；\n"
-            f"4. 上下文管理：遇到包含 `[Compacted]` 或 `[Emergency Compact]` 的历史压缩通知时，专注当前最新目标；上下文过长时可调用 `compact` 归档历史；\n"
-            f"5. 路径约束：所有文件操作均相对于工作区 {base} 进行；\n"
-            f"6. 实事求是：若工具返回报错，请根据错误信息调整参数重试，并在最终回答中如实汇报结果。"
+            f"2. 规划防漂移：面对多步骤复杂任务，按上述双轨分工选择 `todo_write` 或持久 DAG 任务图管理进度，保持焦点不偏离目标；\n"
+            f"3. 隔离子代理调研：遇到需要大范围检索、探索目录结构或读取多份文件的独立子任务，优先调用 `task` 委派一次性子代理在隔离上下文中处理，仅回收精炼摘要；\n"
+            f"4. 按需加载技能：若任务命中上方某项专业技能领域，请先调用 `load_skill` 读取完整操作规范后再执行；\n"
+            f"5. 上下文管理：遇到包含 `[Compacted]` 或 `[Emergency Compact]` 的历史压缩通知时，专注当前最新目标；上下文过长时可调用 `compact` 归档历史；\n"
+            f"6. 路径约束：所有文件操作均相对于工作区 {base} 进行；\n"
+            f"7. 实事求是：若工具返回报错，请根据错误信息调整参数重试，并在最终回答中如实汇报结果。"
         )
     ]
 
@@ -125,17 +147,90 @@ def create_default_memory_manager(
     )
 
 
-def create_default_tools(
+def create_shared_tools(
     workdir: Optional[Path] = None,
     skill_loader: Optional[SkillLoader] = None,
     todo_mgr: Optional[TodoManager] = None,
 ) -> ToolManager:
-    """创建并装配好 5 大核心工具、`load_skill`、`todo_write` 与 `compact` 的 `ToolManager` 实例。"""
-    manager = register_core_tools(ToolManager(), workdir=workdir or WORKDIR)
+    """
+    创建共享基础工具集 `shared_tools`（5 大核心工具 + `load_skill` + `todo_write`）。
+
+    Why:
+        将基础工具与父循环专属工具（`compact`、`task` 等）显式分层拆开，既让一次性子代理与
+        后续持久队友可以安全克隆 `shared_tools` 而不会继承递归委派或会话压缩工具，
+        也便于父代理在此基础上增量挂载控制工具。
+    """
+    target_workdir = workdir or WORKDIR
+    manager = register_core_tools(ToolManager(), workdir=target_workdir)
     active_loader = skill_loader if skill_loader is not None else default_skill_loader
     active_todo = todo_mgr if todo_mgr is not None else default_todo_mgr
     register_skill_tools(manager, active_loader)
     register_todo_tools(manager, active_todo)
+    return manager
+
+
+def create_default_task_store(
+    workdir: Optional[Path] = None,
+    tasks_dir: Optional[Path] = None,
+) -> TaskStore:
+    """创建并绑定目标工作区 `.agent/tasks/` 的持久化 DAG 任务图存储器。"""
+    target_workdir = (workdir or WORKDIR).resolve()
+    target_dir = tasks_dir if tasks_dir is not None else build_agent_paths(target_workdir).tasks_dir
+    return TaskStore(directory=target_dir, workdir=target_workdir)
+
+
+def create_default_subagent_runner(
+    tool_mgr: Optional[ToolManager] = None,
+    workdir: Optional[Path] = None,
+    max_turns: int = 15,
+    llm_caller: Optional[Callable[..., Any]] = None,
+) -> SubagentRunner:
+    """基于 `shared_tools` 创建默认一次性隔离子代理运行器（内部自动剥离禁入工具）。"""
+    target_workdir = workdir or WORKDIR
+    base_shared = tool_mgr if tool_mgr is not None else create_shared_tools(workdir=target_workdir)
+    return SubagentRunner(
+        shared_tools=base_shared,
+        workdir=target_workdir,
+        max_turns=max_turns,
+        llm_caller=llm_caller,
+    )
+
+
+def create_default_tools(
+    workdir: Optional[Path] = None,
+    skill_loader: Optional[SkillLoader] = None,
+    todo_mgr: Optional[TodoManager] = None,
+    task_store: Optional[TaskStore] = None,
+    subagent_runner: Optional[SubagentRunner] = None,
+    shared_tool_mgr: Optional[ToolManager] = None,
+) -> ToolManager:
+    """
+    创建并装配父级主循环工具集 `parent_tools`。
+
+    在 `shared_tools`（5 大核心工具 + `load_skill` + `todo_write`）基础上额外挂载父级专属工具：
+        - 计划第二轨：`create_task`, `update_task`, `list_tasks`, `get_task`, `claim_task`, `complete_task`；
+        - 代理与控制：`compact`, `task`。
+    """
+    target_workdir = workdir or WORKDIR
+    base_shared = (
+        shared_tool_mgr
+        if shared_tool_mgr is not None
+        else create_shared_tools(
+            workdir=target_workdir,
+            skill_loader=skill_loader,
+            todo_mgr=todo_mgr,
+        )
+    )
+    # Why: 从纯净 shared_tools 克隆出新容器再挂载父级工具（DAG 任务图 + compact + task），
+    # 既确保传入的 shared_tool_mgr 不被原地污染，也阻止一次性子代理触碰或篡改父级 DAG 任务图。
+    manager = base_shared.clone()
+
+    active_task_store = (
+        task_store
+        if task_store is not None
+        else create_default_task_store(workdir=target_workdir)
+    )
+    register_task_tools(manager, active_task_store)
 
     @manager.register(
         name="compact",
@@ -145,6 +240,15 @@ def create_default_tools(
     def run_compact() -> str:
         return "已收到压缩请求。当前轮次工具执行完毕后，系统将立即触发上下文历史归档与裁剪！"
 
+    # Why: 若外部未传入 subagent_runner，则基于未混入 DAG 任务图与 compact/task 的 base_shared 构造，
+    # 保证默认派发的子代理工作在目标 workdir 且严格隔离父级控制权。
+    active_runner = (
+        subagent_runner
+        if subagent_runner is not None
+        else create_default_subagent_runner(tool_mgr=base_shared, workdir=target_workdir)
+    )
+    register_subagent_tools(manager, active_runner)
+
     return manager
 
 
@@ -153,11 +257,25 @@ def create_default_hooks(auto_approve: bool = False) -> HookManager:
     return register_default_hooks(HookManager(), auto_approve=auto_approve)
 
 
-default_tools: ToolManager = create_default_tools(
+shared_tools: ToolManager = create_shared_tools(
     workdir=WORKDIR,
     skill_loader=default_skill_loader,
     todo_mgr=default_todo_mgr,
 )
+default_subagent_runner: SubagentRunner = create_default_subagent_runner(
+    tool_mgr=shared_tools,
+    workdir=WORKDIR,
+)
+parent_tools: ToolManager = create_default_tools(
+    workdir=WORKDIR,
+    skill_loader=default_skill_loader,
+    todo_mgr=default_todo_mgr,
+    task_store=default_task_store,
+    subagent_runner=default_subagent_runner,
+    shared_tool_mgr=shared_tools,
+)
+# 向后兼容别名：既有模块与单测仍可通过 default_tools 访问主循环全量工具集
+default_tools: ToolManager = parent_tools
 default_hooks: HookManager = create_default_hooks()
 
 
@@ -194,74 +312,9 @@ def create_session_messages(
     return [{"role": "system", "content": build_system_prompt(workdir=workdir, skill_loader=skill_loader)}]
 
 
-def _get_attr_or_key(obj: Any, name: str, default: Any = None) -> Any:
-    """统一读取 dict 键值或对象属性，兼容真实 OpenAI 对象与测试 Mock 对象。"""
-    if isinstance(obj, dict):
-        return obj.get(name, default)
-    return getattr(obj, name, default)
-
-
-def _serialize_tool_calls(tool_calls: Any) -> List[Dict[str, Any]]:
-    """将模型返回的 `tool_calls` 列表规范化为纯 JSON 可序列化字典列表。"""
-    serialized: List[Dict[str, Any]] = []
-    for tc in tool_calls:
-        fn = _get_attr_or_key(tc, "function")
-        serialized.append(
-            {
-                "id": _get_attr_or_key(tc, "id", ""),
-                "type": _get_attr_or_key(tc, "type", "function"),
-                "function": {
-                    "name": _get_attr_or_key(fn, "name", ""),
-                    "arguments": _get_attr_or_key(fn, "arguments", "") or "{}",
-                },
-            }
-        )
-    return serialized
-
-
-def _assistant_message_to_dict(response_msg: Any) -> Dict[str, Any]:
-    """
-    将模型返回的消息体转换为纯净的 OpenAI `assistant` 消息字典。
-
-    Why:
-        直接将 `ChatCompletionMessage` Pydantic 对象塞回 `messages` 传给部分第三方
-        OpenAI 兼容接口（如 DeepSeek/智谱等）时，可能会序列化出 `refusal`、`annotations`
-        等模型未识别的字段引发 400 错误；转成标准字典最稳妥，也方便后续持久化与日志排查。
-    """
-    content = _get_attr_or_key(response_msg, "content", None)
-    tool_calls = _get_attr_or_key(response_msg, "tool_calls", None)
-
-    msg: Dict[str, Any] = {
-        "role": "assistant",
-        "content": content if content is not None else "",
-    }
-    if tool_calls:
-        msg["tool_calls"] = _serialize_tool_calls(tool_calls)
-    return msg
-
-
-def _parse_tool_arguments(raw_args: Any) -> tuple[Optional[Dict[str, Any]], Optional[str]]:
-    """
-    解析模型生成的工具参数 JSON 字符串。
-
-    :param raw_args: 模型返回的原始 `arguments`（通常为 JSON 字符串，也兼容已是 dict 的 Mock）。
-    :return: `(parsed_dict, error_message)`；解析成功时 `error_message` 为 None。
-    """
-    if isinstance(raw_args, dict):
-        return raw_args, None
-    if raw_args is None or (isinstance(raw_args, str) and not raw_args.strip()):
-        return {}, None
-    if not isinstance(raw_args, str):
-        return None, f"错误: 工具参数格式异常，期望 JSON 字符串，实际为 {type(raw_args).__name__}"
-
-    try:
-        parsed = json.loads(raw_args)
-    except json.JSONDecodeError as exc:
-        return None, f"错误: 工具参数 JSON 解析失败 ({exc})。请输出合法的 JSON 对象。"
-
-    if not isinstance(parsed, dict):
-        return None, f"错误: 工具参数必须是 JSON 对象 (object)，实际收到 {type(parsed).__name__}"
-    return parsed, None
+# 向后兼容别名：消息结构化与工具参数解析已下沉至 coding_agent.llm，供主循环与隔离子代理共同复用
+_assistant_message_to_dict = assistant_message_to_dict
+_parse_tool_arguments = parse_tool_arguments
 
 
 def run_agent_turn(
@@ -435,8 +488,8 @@ def run_agent_turn(
                     if verbose:
                         print(f"\n[工具参数异常]: {fn_name} -> {tool_output}")
                 else:
-                    if verbose:
-                        print(f"\n[调用工具]: {fn_name}({parsed_args})")
+                    # if verbose:
+                    #     print(f"\n[调用工具]: {fn_name}({parsed_args})")q
                     tool_output = execute_tool(fn_name, parsed_args, active_tools, hook_mgr=active_hooks)
 
                 if verbose:
@@ -460,7 +513,7 @@ def run_agent_turn(
             if local_planning["rounds_since_planning"] >= PLANNING_GUARD_THRESHOLD:
                 nudge = (
                     f"[系统守卫提示]: 您已经连续 {PLANNING_GUARD_THRESHOLD} 轮未更新任务计划。"
-                    "请使用 todo_write 梳理或更新当前会话待办步骤，防止长链条执行偏离目标。"
+                    "请使用 todo_write 或持久 DAG 任务图工具（create_task / claim_task / complete_task）梳理或更新当前步骤，防止长链条执行偏离目标。"
                 )
                 active_messages.append({"role": "user", "content": nudge})
                 local_planning["rounds_since_planning"] = 0

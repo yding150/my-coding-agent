@@ -139,7 +139,7 @@ def run_interactive_repl() -> int:
 
     while True:
         try:
-            user_input = input("\nM1 >> ").strip()
+            user_input = input("\n用户输入>> ").strip()
         except (KeyboardInterrupt, EOFError):
             print("\n会话已终止。")
             break

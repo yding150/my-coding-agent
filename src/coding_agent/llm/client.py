@@ -14,13 +14,15 @@ client.py - LLM 客户端与统一调用适配层
 暴露的核心接口：
     - 常量与客户端：`API_KEY`, `BASE_URL`, `DEFAULT_MODEL`, `client`, `get_client`
     - 调用函数：`call_llm`, `call_llm_response`
+    - 消息规范化辅助：`assistant_message_to_dict`, `parse_tool_arguments`
     - 交互探活入口：`main`
 """
 
 from __future__ import annotations
 
+import json
 import os
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -179,6 +181,103 @@ def main() -> None:
         reply = response.content or ""
         print(f"助手回答：{reply}")
         messages.append({"role": "assistant", "content": reply})
+
+
+def _get_attr_or_key(obj: Any, name: str, default: Any = None) -> Any:
+    """统一读取 dict 键值或对象属性，兼容真实 OpenAI 对象与测试 Mock 对象。"""
+    if isinstance(obj, dict):
+        return obj.get(name, default)
+    return getattr(obj, name, default)
+
+
+def _serialize_tool_calls(tool_calls: Any) -> List[Dict[str, Any]]:
+    """将模型返回的 `tool_calls` 列表规范化为纯 JSON 可序列化字典列表。"""
+    serialized: List[Dict[str, Any]] = []
+    for tc in tool_calls:
+        fn = _get_attr_or_key(tc, "function")
+        raw_id = _get_attr_or_key(tc, "id", "")
+        raw_type = _get_attr_or_key(tc, "type", "function")
+        raw_name = _get_attr_or_key(fn, "name", "")
+        raw_args = _get_attr_or_key(fn, "arguments", "")
+
+        # Why: 单元测试常使用 MagicMock 构造 tool_call，未显式设置 `.type` 时
+        # getattr(tc, "type", ...) 会返回子级 MagicMock 而非字符串，必须兜底为 "function"。
+        tc_type = raw_type if isinstance(raw_type, str) and raw_type else "function"
+        tc_id = raw_id if isinstance(raw_id, str) else str(raw_id or "")
+        fn_name = raw_name if isinstance(raw_name, str) else str(raw_name or "")
+        if isinstance(raw_args, dict):
+            fn_args = json.dumps(raw_args, ensure_ascii=False)
+        elif raw_args is None or raw_args == "":
+            fn_args = "{}"
+        elif isinstance(raw_args, str):
+            fn_args = raw_args
+        else:
+            fn_args = str(raw_args)
+
+        serialized.append(
+            {
+                "id": tc_id,
+                "type": tc_type,
+                "function": {
+                    "name": fn_name,
+                    "arguments": fn_args,
+                },
+            }
+        )
+    return serialized
+
+
+def assistant_message_to_dict(response_msg: Any) -> Dict[str, Any]:
+    """
+    将模型返回的消息体转换为纯净的 OpenAI `assistant` 消息字典。
+
+    Why:
+        直接将 `ChatCompletionMessage` Pydantic 对象塞回 `messages` 传给部分第三方
+        OpenAI 兼容接口（如 DeepSeek/智谱等）时，可能会序列化出 `refusal`、`annotations`
+        等模型未识别的字段引发 400 错误；转成标准字典最稳妥，也供主循环与子代理复用。
+    """
+    content = _get_attr_or_key(response_msg, "content", None)
+    tool_calls = _get_attr_or_key(response_msg, "tool_calls", None)
+
+    if isinstance(content, str):
+        normalized_content = content
+    elif content is None or tool_calls:
+        # Why: 若测试 Mock 仅设置了 tool_calls 而未显式置 content=None，避免子 Mock 串入历史文本
+        normalized_content = ""
+    else:
+        normalized_content = str(content)
+
+    msg: Dict[str, Any] = {
+        "role": "assistant",
+        "content": normalized_content,
+    }
+    if tool_calls:
+        msg["tool_calls"] = _serialize_tool_calls(tool_calls)
+    return msg
+
+
+def parse_tool_arguments(raw_args: Any) -> tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """
+    解析模型生成的工具参数 JSON 字符串。
+
+    :param raw_args: 模型返回的原始 `arguments`（通常为 JSON 字符串，也兼容已是 dict 的 Mock）。
+    :return: `(parsed_dict, error_message)`；解析成功时 `error_message` 为 None。
+    """
+    if isinstance(raw_args, dict):
+        return raw_args, None
+    if raw_args is None or (isinstance(raw_args, str) and not raw_args.strip()):
+        return {}, None
+    if not isinstance(raw_args, str):
+        return None, f"错误: 工具参数格式异常，期望 JSON 字符串，实际为 {type(raw_args).__name__}"
+
+    try:
+        parsed = json.loads(raw_args)
+    except json.JSONDecodeError as exc:
+        return None, f"错误: 工具参数 JSON 解析失败 ({exc})。请输出合法的 JSON 对象。"
+
+    if not isinstance(parsed, dict):
+        return None, f"错误: 工具参数必须是 JSON 对象 (object)，实际收到 {type(parsed).__name__}"
+    return parsed, None
 
 
 if __name__ == "__main__":

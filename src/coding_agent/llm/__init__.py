@@ -14,9 +14,11 @@ from coding_agent.llm.client import (
     API_KEY,
     BASE_URL,
     DEFAULT_MODEL,
+    assistant_message_to_dict,
     call_llm,
     call_llm_response,
     get_client,
+    parse_tool_arguments,
 )
 
 __all__ = [
@@ -26,4 +28,6 @@ __all__ = [
     "get_client",
     "call_llm",
     "call_llm_response",
+    "assistant_message_to_dict",
+    "parse_tool_arguments",
 ]
