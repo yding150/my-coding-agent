@@ -21,17 +21,43 @@ builtins.py - 内置通用生命周期钩子库
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+from contextvars import ContextVar
 import json
 import re
-from typing import Callable, List, Optional
+from typing import Callable, Iterator, List, Optional
 
+from coding_agent.config import prompt_console_input
 from coding_agent.hooks.manager import HookEvent, HookManager
+
+_TURN_TOOL_COUNT: ContextVar[Optional[int]] = ContextVar(
+    "coding_agent_turn_tool_count",
+    default=None,
+)
+
+
+@contextmanager
+def turn_tool_summary_scope(count: int) -> Iterator[None]:
+    """
+    为 `HookEvent.STOP` 注入当前 `run_agent_turn` 的精确工具调用次数。
+
+    Why:
+        多轮 REPL 会话中 `session_messages` 会跨轮累积，且 `snip_compact` 会裁剪旧消息；
+        若仅靠统计 `messages` 里的 `role == "tool"` 条数，会出现跨轮虚高或压缩后突然变小的问题。
+    """
+    token = _TURN_TOOL_COUNT.set(count)
+    try:
+        yield
+    finally:
+        _TURN_TOOL_COUNT.reset(token)
 
 # 默认内置的高危系统指令正则模式库（主要覆盖 Windows PowerShell / CMD 与破坏性语句）
 DEFAULT_DANGEROUS_PATTERNS: List[str] = [
     r"\brmdir\s+/[sS]\b",
     r"\bdel\s+/[fF]\b",
-    r"\bformat\b",
+    # Why: 仅匹配处于命令动词位置的 Windows format（或紧跟盘符参数）及 PowerShell Format-Volume，
+    # 避免把常见的 `Format-List` / `Format-Table` 或 `--format` 参数误判为磁盘格式化命令。
+    r"(?:^|[;&|]\s*)format(?:\s|$)|(?<![-\w.])format\s+[A-Za-z]:|\bFormat-Volume\b",
     r"\bRemove-Item\b.*-Recurse",
     r">>\s*system\.ini",
     r">\s*C:\\Windows",
@@ -97,7 +123,7 @@ def create_permission_hook(
 
         while True:
             try:
-                choice = input("是否允许继续执行此危险操作？[y/N]: ").strip().lower()
+                choice = prompt_console_input("是否允许继续执行此危险操作？[y/N]: ").strip().lower()
             except (KeyboardInterrupt, EOFError):
                 # 非交互终端或 Ctrl+C 中断一律按安全兜底拒绝
                 choice = "n"
@@ -129,9 +155,14 @@ def large_output_warning_hook(
 
 def session_summary_hook(messages: list) -> None:
     """
-    【终止切面】在单轮对话或会话终止时，统计本轮累积的 `tool` 调用次数。
+    【终止切面】在单轮对话或会话终止时，统计本轮发生的 `tool` 调用次数。
     """
-    tool_count = sum(1 for m in messages if isinstance(m, dict) and m.get("role") == "tool")
+    turn_count = _TURN_TOOL_COUNT.get()
+    tool_count = (
+        turn_count
+        if turn_count is not None
+        else sum(1 for m in messages if isinstance(m, dict) and m.get("role") == "tool")
+    )
     print(f"\n📊 \033[92m[会话生命周期总结]\033[0m 本轮共发生 {tool_count} 次工具调用。")
 
 

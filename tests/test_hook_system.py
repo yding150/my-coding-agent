@@ -5,12 +5,14 @@ test_hook_system.py - M2.1 生命周期钩子管理器与审批门禁单元测�
 import io
 import json
 import tempfile
+import threading
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import coding_agent.config as config_mod
 import coding_agent.hooks.__main__ as hooks_cli_mod
 import coding_agent.runtime as runtime_mod
 from coding_agent.hooks import (
@@ -78,14 +80,65 @@ class TestHookSystem(unittest.TestCase):
         self.assertEqual(triggered, ["你好 Agent"])
 
     def test_permission_hook_detection(self):
-        """测试安全命令与非 Shell 工具自动放行"""
+        """测试安全命令、PowerShell 格式化输出与非 Shell 工具自动放行，真实格式化盘符仍拦截"""
         perm_hook = create_permission_hook(auto_approve=False)
 
-        safe_res = perm_hook("run_shell", {"command": "dir"})
-        self.assertIsNone(safe_res)
+        for safe_cmd in (
+            "dir",
+            "Get-Item README.md | Format-List",
+            "Get-Item README.md | Format-Table -AutoSize",
+            "git log --format=%H -n 5",
+        ):
+            self.assertIsNone(perm_hook("run_shell", {"command": safe_cmd}), safe_cmd)
 
         read_res = perm_hook("read_file", {"path": "test.txt"})
         self.assertIsNone(read_res)
+
+        for danger_cmd in ("format D:", "cmd /c format D:", "Format-Volume -DriveLetter D"):
+            with patch("builtins.input", return_value="n"), redirect_stdout(io.StringIO()):
+                blocked = perm_hook("run_shell", {"command": danger_cmd})
+            self.assertIsNotNone(blocked, danger_cmd)
+            self.assertIn("拒绝了此高危操作", str(blocked))
+
+    def test_console_input_coordinator_forwards_repl_line_to_background_approval(self):
+        """REPL 阻塞等待输入时，后台审批请求必须接管该行输入，防止 stdin 竞态与把 'y' 当成用户指令"""
+        coord = config_mod.ConsoleInputCoordinator()
+        repl_entered = threading.Event()
+        release_input = threading.Event()
+        repl_result = {}
+        bg_result = {}
+
+        def fake_input(prompt: str) -> str:
+            if "用户输入" in prompt:
+                repl_entered.set()
+                release_input.wait(timeout=2.0)
+                return "y"
+            raise AssertionError(f"后台审批不应并发直接调用 input(): {prompt}")
+
+        def repl_worker():
+            repl_result["value"] = coord.read_repl_line("\n用户输入>> ")
+
+        def bg_worker():
+            self.assertTrue(repl_entered.wait(timeout=2.0))
+            with redirect_stdout(io.StringIO()):
+                # 稍微触发后通知假 input 返回用户敲下的 'y'
+                timer = threading.Timer(0.05, release_input.set)
+                timer.start()
+                try:
+                    bg_result["value"] = coord.prompt_input("是否允许？[y/N]: ")
+                finally:
+                    timer.cancel()
+
+        with patch("builtins.input", side_effect=fake_input):
+            t_repl = threading.Thread(target=repl_worker)
+            t_bg = threading.Thread(target=bg_worker)
+            t_repl.start()
+            t_bg.start()
+            t_repl.join(timeout=3.0)
+            t_bg.join(timeout=3.0)
+
+        self.assertEqual(bg_result.get("value"), "y")
+        self.assertEqual(repl_result.get("value"), (True, ""))
 
     def test_permission_hook_interactive_allow_and_deny(self):
         """测试危险指令触发 HITL 审批门禁时的授权放行、拒绝拦截与默认回车拒绝"""
@@ -279,6 +332,41 @@ class TestHookRuntimeIntegration(unittest.TestCase):
         self.assertEqual(turn, 2)
         self.assertEqual(stop_calls, 2)
         self.assertEqual(reply, "已补充检查，最终完成。")
+
+    def test_session_summary_hook_counts_only_current_turn_across_multi_turn_session(self):
+        """多轮会话且历史中已包含旧 tool 消息时，Stop 总结只应统计本轮实际工具调用次数"""
+        hooks = runtime_mod.create_default_hooks(auto_approve=True)
+        # 模拟前面几轮遗留在 session_messages 里的 10 条历史工具消息
+        for i in range(10):
+            self.messages.append({"role": "assistant", "content": "", "tool_calls": [{"id": f"old_{i}", "type": "function", "function": {"name": "glob_files", "arguments": "{}"}}]})
+            self.messages.append({"role": "tool", "tool_call_id": f"old_{i}", "content": "ok"})
+
+        step = 0
+
+        def scripted_llm(messages, tools):
+            nonlocal step
+            step += 1
+            if step == 1:
+                return self._fake_msg(
+                    tool_calls=[{"id": "new_1", "name": "glob_files", "arguments": {"pattern": "*"}}]
+                )
+            return self._fake_msg(content="本轮只调了 1 次工具。")
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            reply = runtime_mod.run_agent_turn(
+                "仅执行 1 次工具",
+                tools=self.tools,
+                hooks=hooks,
+                messages=self.messages,
+                llm_caller=scripted_llm,
+                workdir=self.workdir,
+                verbose=False,
+            )
+
+        self.assertEqual(reply, "本轮只调了 1 次工具。")
+        self.assertIn("本轮共发生 1 次工具调用", buf.getvalue())
+        self.assertNotIn("11 次", buf.getvalue())
 
 
 if __name__ == "__main__":

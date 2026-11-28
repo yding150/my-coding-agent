@@ -53,7 +53,7 @@ Copy-Item .env.example .env
   - [x] **M5.2**：Cron 定时调度引擎 + 并发唤醒线程集成（`cron/`, `runtime.py`, `cli.py`）
 - **M6：多 Agent 团队协同与邮箱通信**
   - [x] **M6.1**：离线 JSONL 邮箱与团队审批协议（`teams/bus.py`, `teams/protocol.py`）
-  - [ ] **M6.2**：常驻队友线程、团队工具与主循环收件箱唤醒（`teams/runtime.py`, `teams/tools.py`, `runtime.py`）
+  - [x] **M6.2**：常驻队友线程、团队工具与主循环收件箱唤醒（`teams/runtime.py`, `teams/tools.py`, `runtime.py`）
 - **M7：MCP 外部插件体系**
   - [ ] **M7.1**：MCP 客户端与内置模拟插件服务（`mcp/client.py`, `mcp/servers.py`）
   - [ ] **M7.2**：MCP 动态工具池装配与分级安全审批（`mcp/manager.py`, `mcp/tools.py`, `runtime.py`）

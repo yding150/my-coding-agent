@@ -23,9 +23,10 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-from dataclasses import dataclass
+import threading
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Optional, Sequence, Tuple
 
 from dotenv import load_dotenv
 
@@ -58,6 +59,97 @@ def configure_utf8_console() -> None:
 
 
 configure_utf8_console()
+
+
+@dataclass
+class _PendingInputRequest:
+    """后台线程在 REPL 等待输入期间发起的控制台审批请求。"""
+
+    prompt_text: str
+    event: threading.Event = field(default_factory=threading.Event)
+    value: Optional[str] = None
+    error: Optional[BaseException] = None
+
+
+class ConsoleInputCoordinator:
+    """
+    控制台标准输入单点协调器：防止 REPL 主循环与后台唤醒线程同时调用 `input()` 抢占 stdin。
+
+    Why:
+        当 REPL 主线程阻塞在 `input("用户输入>> ")` 时，若后台 Cron/Team 线程触发了
+        `Permission 审批` 也调用 `input()`，两个线程会并发争抢标准输入，导致按键被误吃或
+        把审批输入 `y` 当成新的聊天指令发送给大模型。本协调器确保交互模式下由 REPL 线程
+        统一读取并把审批行精准转交给挂起的后台请求。
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._repl_waiting: bool = False
+        self._pending: Optional[_PendingInputRequest] = None
+
+    def read_repl_line(self, prompt_text: str) -> Tuple[bool, str]:
+        """
+        供 REPL 主循环读取一行终端输入。
+
+        :return: `(forwarded, text)`；若本行输入已转交给后台审批请求，则 `forwarded=True` 且
+            `text=""`，调用方应跳过并将其忽略为普通命令。
+        """
+        with self._lock:
+            self._repl_waiting = True
+        try:
+            line = input(prompt_text)
+        except BaseException as exc:
+            with self._lock:
+                self._repl_waiting = False
+                pending = self._pending
+                self._pending = None
+            if pending is not None:
+                pending.error = exc
+                pending.event.set()
+            raise
+
+        with self._lock:
+            self._repl_waiting = False
+            pending = self._pending
+            self._pending = None
+        if pending is not None:
+            pending.value = line
+            pending.event.set()
+            return True, ""
+        return False, line
+
+    def prompt_input(self, prompt_text: str) -> str:
+        """
+        供权限门禁等组件读取审批输入；若 REPL 正在等待输入则走转交，否则直调 `input()`。
+        """
+        with self._lock:
+            if not self._repl_waiting or self._pending is not None:
+                req = None
+            else:
+                req = _PendingInputRequest(prompt_text=prompt_text)
+                self._pending = req
+
+        if req is None:
+            return input(prompt_text)
+
+        print(prompt_text, end="", flush=True)
+        req.event.wait()
+        if req.error is not None:
+            raise req.error
+        return req.value or ""
+
+
+DEFAULT_INPUT_COORDINATOR = ConsoleInputCoordinator()
+
+
+def read_repl_line(prompt_text: str) -> Tuple[bool, str]:
+    """通过全局控制台输入协调器读取 REPL 输入行。"""
+    return DEFAULT_INPUT_COORDINATOR.read_repl_line(prompt_text)
+
+
+def prompt_console_input(prompt_text: str) -> str:
+    """通过全局控制台输入协调器安全读取交互审批输入。"""
+    return DEFAULT_INPUT_COORDINATOR.prompt_input(prompt_text)
 
 
 @dataclass(frozen=True)

@@ -19,13 +19,14 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Sequence
 
-from coding_agent.config import WORKDIR, configure_utf8_console
+from coding_agent.config import WORKDIR, configure_utf8_console, read_repl_line
 from coding_agent.runtime import (
     agent_lock,
     create_default_tools,
     create_session_messages,
     default_bg_manager,
     default_skill_loader,
+    default_team_manager,
     default_tools,
     run_agent_turn,
     session_messages,
@@ -125,6 +126,9 @@ def run_demo_mode() -> int:
                 verbose=True,
             )
         finally:
+            demo_team = getattr(demo_tools, "_team_manager", None)
+            if demo_team is not None:
+                demo_team.shutdown_all()
             demo_bg = getattr(demo_tools, "_bg_manager", None)
             if demo_bg is not None:
                 demo_bg.cleanup_all()
@@ -149,11 +153,20 @@ def run_interactive_repl() -> int:
     start_runtime_threads()
     try:
         while True:
+            # Why: 若后台 Cron/Team 线程刚抢到锁正在输出响应，先等它释放 agent_lock 再打印提示符，
+            # 防止异步日志与提示符混杂，也确保后续 REPL 与后台交互输入状态一致。
+            with agent_lock:
+                pass
+
             try:
-                user_input = input("\n用户输入>> ").strip()
+                forwarded, raw_input = read_repl_line("\n用户输入>> ")
             except (KeyboardInterrupt, EOFError):
                 print("\n会话已终止。")
                 break
+
+            if forwarded:
+                continue
+            user_input = raw_input.strip()
 
             if not user_input:
                 continue
@@ -175,6 +188,7 @@ def run_interactive_repl() -> int:
                 print(f"\n[执行失败]: {exc}", file=sys.stderr)
     finally:
         stop_runtime_threads()
+        default_team_manager.shutdown_all()
         default_bg_manager.cleanup_all()
 
     return 0
@@ -217,6 +231,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(f"\n[执行失败]: {exc}", file=sys.stderr)
         return 1
     finally:
+        default_team_manager.shutdown_all()
         default_bg_manager.cleanup_all()
     return 0
 

@@ -1,11 +1,11 @@
 """
-runtime.py - Coding Agent 单 Agent 主循环驱动引擎（已集成 M2~M5.2 Hook/Skill/Todo/Context/Memory/Subagent/DAG Tasks/Background/Cron）
+runtime.py - Coding Agent 单 Agent 主循环驱动引擎（已集成 M2~M6.2 全套底层与多 Agent 团队运行时）
 
 架构角色：
     连接“大模型大脑 (`coding_agent.llm`)”、“本地工具手脚 (`coding_agent.tools`)”、
     “生命周期切面门禁 (`coding_agent.hooks`)”、“按需专业技能 (`coding_agent.skills`)”、
     “双轨计划系统 (`coding_agent.tasks`: 会话 Todo + 持久 DAG 任务图)”、“四步上下文压缩 (`coding_agent.context`)”、
-    “跨会话持久记忆 (`coding_agent.memory`)”、“一次性隔离子代理 (`coding_agent.subagent`)”、
+    “跨会话持久记忆 (`coding_agent.memory`)”、“双轨代理 (`coding_agent.subagent` + `coding_agent.teams`)”、
     “异步后台任务 (`coding_agent.background`)”与“Cron 定时调度及并发唤醒 (`coding_agent.cron`)”的核心驱动引擎。
 
 解决的核心痛点：
@@ -16,16 +16,17 @@ runtime.py - Coding Agent 单 Agent 主循环驱动引擎（已集成 M2~M5.2 Ho
     5. 通过 `MemoryManager` 在会话启动前按需召回 `.agent/memory/` 历史偏好并在结束时提炼落盘；
     6. 通过 `shared_tools` / `parent_tools` 工具分层与 `SubagentRunner`，让主代理经 `task` 外包探索且隔离上下文噪音、杜绝递归套娃；
     7. 通过 `BackgroundTaskManager` 将耗时命令非阻塞派发到后台线程执行，并在后续推理轮次前合法注入 `<task_notification>`；
-    8. 通过 `CronSchedulerManager`、`agent_lock` 互斥锁与 `cron_scheduler_loop`/`queue_processor_loop` 实现会话空闲时的安全定时唤醒与失败回滚；
-    9. 严格遵守 OpenAI `assistant(tool_calls)` 与 `tool(tool_call_id)` 的消息配对协议，并受 `MAX_AGENT_TURNS` 保护。
+    8. 通过 `CronSchedulerManager`、`agent_lock` 互斥锁与 `cron_scheduler_loop`/`queue_processor_loop` 实现定时唤醒与防竞态；
+    9. 通过 `MessageBus` + `TeamProtocols` + `TeamManager` 启动常驻队友并在 `queue_processor_loop` 中消费 Lead 收件箱自动唤醒；
+    10. 严格遵守 OpenAI `assistant(tool_calls)` 与 `tool(tool_call_id)` 的消息配对协议，并受 `MAX_AGENT_TURNS` 保护。
 
 暴露的核心接口：
-    - `build_system_prompt`: 生成绑定工作区、轻量技能目录、双轨计划分工、后台与定时调度指引及召回记忆的系统提示词
-    - `create_shared_tools` / `create_default_subagent_runner` / `create_default_task_store` / `create_default_bg_manager` / `create_default_cron_manager` / `create_default_tools` / `create_default_hooks` / `create_default_compactor` / `create_default_memory_manager`
-    - `shared_tools` / `parent_tools` / `default_tools` / `default_subagent_runner` / `default_task_store` / `default_bg_manager` / `BG_MANAGER` / `default_cron_manager` / `CRON_MANAGER`
-    - `agent_lock` / `RUNTIME_STOP` / `runtime_threads` / `cron_scheduler_loop` / `queue_processor_loop` / `start_runtime_threads` / `stop_runtime_threads`
+    - `build_system_prompt`: 生成绑定工作区、轻量技能目录、双轨计划/代理规范、后台与定时调度指引及召回记忆的系统提示词
+    - `create_shared_tools` / `create_default_*` (`subagent_runner`, `task_store`, `bg_manager`, `cron_manager`, `bus`, `protocols`, `team_manager`, `tools`, `hooks`, `compactor`, `memory_manager`)
+    - `shared_tools` / `parent_tools` / `default_tools` / `BG_MANAGER` / `CRON_MANAGER` / `BUS` / `PROTOCOLS` / `TEAM_MGR`
+    - `agent_lock` / `RUNTIME_STOP` / `runtime_threads` / `format_team_events` / `cron_scheduler_loop` / `queue_processor_loop` / `start_runtime_threads` / `stop_runtime_threads`
     - `execute_tool`: 经由 `PreToolUse` / `PostToolUse` 切面包装的安全工具执行函数
-    - `run_agent_turn`: 执行单次用户提问或定时唤醒驱动的多轮工具调用闭环
+    - `run_agent_turn`: 执行单次用户输入、定时唤醒或团队事件驱动的多轮闭环
     - `create_session_messages` / `session_messages` / `default_*`
 """
 
@@ -39,6 +40,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from coding_agent.background import BackgroundTaskManager, register_background_tools
 from coding_agent.config import (
+    MAILBOX_DIR,
     MAX_AGENT_TURNS,
     MEMORY_DIR,
     SCHEDULED_TASKS_FILE,
@@ -53,6 +55,7 @@ from coding_agent.config import (
 from coding_agent.context import ContextCompactor
 from coding_agent.cron import CronSchedulerManager, register_cron_tools
 from coding_agent.hooks import HookEvent, HookManager, register_default_hooks
+from coding_agent.hooks.builtins import turn_tool_summary_scope
 from coding_agent.llm import assistant_message_to_dict, call_llm, parse_tool_arguments
 from coding_agent.memory import MemoryManager
 from coding_agent.skills import SkillLoader, register_skill_tools
@@ -63,11 +66,12 @@ from coding_agent.tasks import (
     register_task_tools,
     register_todo_tools,
 )
+from coding_agent.teams import MessageBus, TeamManager, TeamProtocols, register_team_tools
 from coding_agent.tools import ToolManager, register_core_tools
 
 configure_utf8_console()
 
-# 默认技能加载器、双轨计划管理器、后台与定时调度器、上下文压缩器、跨会话记忆管理器与并发控制原语
+# 默认技能加载器、双轨计划管理器、后台与定时调度器、团队协同基础设施、压缩器、记忆管理器与并发控制原语
 default_skill_loader: SkillLoader = SkillLoader(SKILLS_DIR)
 default_todo_mgr: TodoManager = TodoManager()
 default_task_store: TaskStore = TaskStore(TASKS_DIR, workdir=WORKDIR)
@@ -78,9 +82,20 @@ default_cron_manager: CronSchedulerManager = CronSchedulerManager(
     durable_file=SCHEDULED_TASKS_FILE,
 )
 CRON_MANAGER: CronSchedulerManager = default_cron_manager
+default_bus: MessageBus = MessageBus(workdir=WORKDIR, mailbox_dir=MAILBOX_DIR)
+BUS: MessageBus = default_bus
+default_protocols: TeamProtocols = TeamProtocols()
+PROTOCOLS: TeamProtocols = default_protocols
+default_team_manager: TeamManager = TeamManager(
+    bus=default_bus,
+    task_store=default_task_store,
+    protocols=default_protocols,
+    workdir=WORKDIR,
+)
+TEAM_MGR: TeamManager = default_team_manager
 default_compactor: ContextCompactor = ContextCompactor(TRANSCRIPT_DIR, TOOL_RESULTS_DIR)
 default_memory_mgr: MemoryManager = MemoryManager(MEMORY_DIR, workdir=WORKDIR)
-# Why: 前台用户输入、后台 Cron 消费者与未来团队事件线程共享 session_messages，
+# Why: 前台用户输入、后台 Cron 消费者与 Lead 团队事件线程共享 session_messages，
 # 采用 RLock 允许同一线程内（例如 cli 外层与 run_agent_turn 内部）安全重入，同时跨线程严格互斥。
 agent_lock: threading.RLock = threading.RLock()
 RUNTIME_STOP: threading.Event = threading.Event()
@@ -88,7 +103,7 @@ runtime_threads: List[threading.Thread] = []
 session_messages: List[Dict[str, Any]] = []
 rounds_since_planning: int = 0
 PLANNING_GUARD_THRESHOLD: int = 5
-# 规划与任务分解类工具（调用 Todo、持久 DAG 任务图或委派 Subagent 均视为主动推进计划，清零守卫计数）
+# 规划与任务分解类工具（调用 Todo、持久 DAG 任务图、Subagent 或启动团队队友均视为主动推进计划，清零守卫计数）
 PLANNING_TOOLS: tuple[str, ...] = (
     "todo_write",
     "task",
@@ -96,6 +111,7 @@ PLANNING_TOOLS: tuple[str, ...] = (
     "update_task",
     "claim_task",
     "complete_task",
+    "spawn_teammate",
 )
 
 
@@ -123,6 +139,12 @@ def build_system_prompt(
             f"【双轨计划分工规范 (Two-Tier Planning Rules)】：\n"
             f"1. 计划第一轨·轻量会话待办（`todo_write`）：纯内存整表覆盖更新，适合当前会话内 3~8 步短期步骤跟踪，防止长工具链思维漂移；\n"
             f"2. 计划第二轨·持久 DAG 任务图（`create_task` / `update_task` / `list_tasks` / `get_task` / `claim_task` / `complete_task`）：持久化保存于 `.agent/tasks/`，适合多阶段依赖编排与跨会话断点恢复；必须严格走两阶段建图——先 `create_task` 获取真实 `task_xxxxxxxx` ID，再 `update_task(task_id, addBlockedBy)` 建立依赖边，随后 `claim_task` 认领与 `complete_task` 完成解锁下游。\n\n"
+            f"【双轨代理分工与团队协同规范 (Dual-Track Delegation & Team Rules)】：\n"
+            f"1. 代理第一轨·一次性隔离子代理（`task`）：针对单点探索、目录摸底或大文件只读检索，同步运行且中间噪声彻底隔离，仅返回精炼摘要；\n"
+            f"2. 代理第二轨·持久化多 Agent 团队（`spawn_teammate` / `send_message` / `request_plan` / `approve_plan` / `request_shutdown` / `list_teammates` / `read_inbox`）："
+            f"面对跨模块长期并行工程，应先向用户简述分工方案并等待用户批准后再调用 `spawn_teammate`；收到队友的 `plan_approval_request` 时须调用 `approve_plan` 放行或驳回；"
+            f"严禁在主循环使用 `Start-Sleep` 忙等，也严禁用 `read_file` 或 Shell 直接读取 `.agent/mailboxes/`（请使用 `read_inbox` 或等待系统在轮次间自动注入收件箱）；"
+            f"若已在当前轮次内完成审批、核验与关机，请仅输出一次最终总结；当因 `[Team events 团队动态事件]` 被后台唤醒且仅包含 `shutdown_response`（关机下线）或 `idle_notification`（状态就绪）、无新增业务结果时，只需一句话简短确认状态即可，不要重复输出已汇报过的完整任务总结。\n\n"
             f"【基本工作准则】：\n"
             f"1. 行动优先：查看文件、列目录、修改代码或验证结果时，直接调用工具获取真实信息，不要凭空猜测；\n"
             f"2. 规划防漂移：面对多步骤复杂任务，按上述双轨分工选择 `todo_write` 或持久 DAG 任务图管理进度，保持焦点不偏离目标；\n"
@@ -218,6 +240,44 @@ def create_default_cron_manager(
     return CronSchedulerManager(workdir=target_workdir, durable_file=durable_file)
 
 
+def create_default_bus(
+    workdir: Optional[Path] = None,
+    mailbox_dir: Optional[Path | str] = None,
+) -> MessageBus:
+    """创建并绑定目标工作区 `.agent/mailboxes/` 的异步 JSONL 邮箱总线。"""
+    target_workdir = (workdir or WORKDIR).resolve()
+    target_mailbox = (
+        mailbox_dir if mailbox_dir is not None else build_agent_paths(target_workdir).mailbox_dir
+    )
+    return MessageBus(workdir=target_workdir, mailbox_dir=target_mailbox)
+
+
+def create_default_protocols() -> TeamProtocols:
+    """创建默认团队控制协议与计划审批闸门管理器。"""
+    return TeamProtocols()
+
+
+def create_default_team_manager(
+    workdir: Optional[Path] = None,
+    bus: Optional[MessageBus] = None,
+    task_store: Optional[TaskStore] = None,
+    protocols: Optional[TeamProtocols] = None,
+    llm_caller: Optional[Callable[..., Any]] = None,
+) -> TeamManager:
+    """创建并绑定工作区消息总线、任务图与控制协议的团队管理器。"""
+    target_workdir = (workdir or WORKDIR).resolve()
+    active_bus = bus if bus is not None else create_default_bus(workdir=target_workdir)
+    active_store = task_store if task_store is not None else create_default_task_store(workdir=target_workdir)
+    active_protocols = protocols if protocols is not None else create_default_protocols()
+    return TeamManager(
+        bus=active_bus,
+        task_store=active_store,
+        protocols=active_protocols,
+        workdir=target_workdir,
+        llm_caller=llm_caller,
+    )
+
+
 def create_default_subagent_runner(
     tool_mgr: Optional[ToolManager] = None,
     workdir: Optional[Path] = None,
@@ -242,6 +302,9 @@ def create_default_tools(
     task_store: Optional[TaskStore] = None,
     bg_mgr: Optional[BackgroundTaskManager] = None,
     cron_mgr: Optional[CronSchedulerManager] = None,
+    team_mgr: Optional[TeamManager] = None,
+    bus: Optional[MessageBus] = None,
+    protocols: Optional[TeamProtocols] = None,
     subagent_runner: Optional[SubagentRunner] = None,
     shared_tool_mgr: Optional[ToolManager] = None,
 ) -> ToolManager:
@@ -252,6 +315,7 @@ def create_default_tools(
         - 计划第二轨：`create_task`, `update_task`, `list_tasks`, `get_task`, `claim_task`, `complete_task`；
         - 异步后台：升级支持 `run_in_background` 的 `run_shell`，并挂载 `check_bg_task`, `kill_bg_task`, `list_bg_tasks`；
         - 定时调度：`schedule_cron`, `list_crons`, `cancel_cron`；
+        - 团队协同：`spawn_teammate`, `send_message`, `request_plan`, `approve_plan`, `request_shutdown`, `list_teammates`, `read_inbox`；
         - 代理与控制：`compact`, `task`。
     """
     target_workdir = workdir or WORKDIR
@@ -264,8 +328,8 @@ def create_default_tools(
             todo_mgr=todo_mgr,
         )
     )
-    # Why: 从纯净 shared_tools 克隆出新容器再挂载父级工具（DAG + 后台 + Cron + compact + task），
-    # 既确保传入的 shared_tool_mgr 不被原地污染，也防止同步子代理误注册定时任务或启动长后台进程。
+    # Why: 从纯净 shared_tools 克隆出新容器再挂载父级工具（DAG + 后台 + Cron + 团队 + compact + task），
+    # 既确保传入的 shared_tool_mgr 不被原地污染，也防止同步子代理误派生常驻队友或注册定时任务。
     manager = base_shared.clone()
 
     active_task_store = (
@@ -291,6 +355,31 @@ def create_default_tools(
     )
     register_cron_tools(manager, active_cron_mgr)
 
+    active_bus = (
+        bus
+        if bus is not None
+        else (team_mgr.bus if team_mgr is not None else create_default_bus(workdir=target_workdir))
+    )
+    active_protocols = (
+        protocols
+        if protocols is not None
+        else (team_mgr.protocols if team_mgr is not None else create_default_protocols())
+    )
+    active_team_mgr = (
+        team_mgr
+        if team_mgr is not None
+        else create_default_team_manager(
+            workdir=target_workdir,
+            bus=active_bus,
+            task_store=active_task_store,
+            protocols=active_protocols,
+        )
+    )
+    register_team_tools(manager, active_team_mgr, active_bus, active_protocols)
+    setattr(manager, "_team_manager", active_team_mgr)
+    # Why: 在工具集上保留所属消息总线引用，使前台主循环也能按工作区消费 Lead 未读信箱避免重复唤醒。
+    setattr(manager, "_bus", active_bus)
+
     @manager.register(
         name="compact",
         description="主动触发上下文压缩归档。将过往对话转存至 .agent/transcripts/ 转录文件，并裁剪冗余历史。",
@@ -299,7 +388,7 @@ def create_default_tools(
     def run_compact() -> str:
         return "已收到压缩请求。当前轮次工具执行完毕后，系统将立即触发上下文历史归档与裁剪！"
 
-    # Why: 若外部未传入 subagent_runner，则基于未混入父级控制与后台工具的 base_shared 构造，
+    # Why: 若外部未传入 subagent_runner，则基于未混入父级控制与后台/团队工具的 base_shared 构造，
     # 保证默认派发的子代理工作在目标 workdir 且严格隔离父级权限。
     active_runner = (
         subagent_runner
@@ -332,6 +421,9 @@ parent_tools: ToolManager = create_default_tools(
     task_store=default_task_store,
     bg_mgr=default_bg_manager,
     cron_mgr=default_cron_manager,
+    team_mgr=default_team_manager,
+    bus=default_bus,
+    protocols=default_protocols,
     subagent_runner=default_subagent_runner,
     shared_tool_mgr=shared_tools,
 )
@@ -392,17 +484,19 @@ def run_agent_turn(
     memory_mgr: Optional[MemoryManager] = None,
     bg_mgr: Optional[BackgroundTaskManager] = None,
     cron_mgr: Optional[CronSchedulerManager] = None,
+    bus: Optional[MessageBus] = None,
     planning_state: Optional[Dict[str, int]] = None,
     max_turns: Optional[int] = None,
     is_scheduled: bool = False,
+    is_team_event: bool = False,
     lock: Optional[Any] = None,
     verbose: bool = True,
 ) -> str:
     """
-    执行一次用户输入或定时调度触发的单 Agent 闭环（核心 `while True` 工具循环 + 全套运行时子系统）。
+    执行一次用户输入、定时调度或团队收件箱事件触发的单 Agent 闭环（核心 `while True` 循环）。
 
     运行流程：
-        1. 若非定时唤醒，触发 `UserPromptSubmit` 切面；追加 `user` 消息（定时任务带 `⏰` 前缀）；
+        1. 若非定时/团队自动唤醒，触发 `UserPromptSubmit` 切面；追加 `user` 消息；
         2. 会话启动前按需召回跨会话记忆并刷新顶部 `system` 提示词；
         3. 每次调用大模型前注入已就绪的 `<task_notification>` 后台通知，并执行 `ContextCompactor.prepare()` 四步压缩管线；
         4. 调用大模型（携带 `tools.get_schemas()`），遇上下文超长异常则执行 `reactive_compact` 自愈重试；
@@ -413,7 +507,7 @@ def run_agent_turn(
         7. 执行连续未规划守卫（`rounds_since_planning >= 5`）以及主动 `compact` 归档裁剪；
         8. 回到步骤 3 让模型“看见”工具结果，直到给出最终回复或触发 `max_turns` 上限保护。
 
-    :param prompt: 用户本轮输入的自然语言指令或定时任务提示词。
+    :param prompt: 用户本轮输入的自然语言指令、定时任务提示词或团队收件箱事件摘要。
     :param tools: 工具管理器，默认使用绑定 `WORKDIR` 的 `default_tools`。
     :param hooks: 生命周期钩子管理器，默认使用 `default_hooks`。
     :param messages: 对话消息列表（原地追加更新），默认使用模块级 `session_messages`。
@@ -429,6 +523,7 @@ def run_agent_turn(
         传入自定义 `messages` 时默认隔离新建，未传 `messages` 时默认使用模块级计数器。
     :param max_turns: 单次用户提问最多允许的模型调用轮数，默认取 `MAX_AGENT_TURNS`。
     :param is_scheduled: 是否来自 `queue_processor_loop` 的后台 Cron 定时唤醒。
+    :param is_team_event: 是否来自 `queue_processor_loop` 的 Lead 收件箱团队事件唤醒。
     :param lock: 可选显式并发互斥锁；默认会话（`messages=None`）会自动受 `agent_lock` 保护。
     :param verbose: 是否向终端打印工具调用与助手回答过程。
     :return: 模型最终输出的回复文本（若超限则返回提示文本）。
@@ -445,6 +540,7 @@ def run_agent_turn(
         if bg_mgr is not None
         else (getattr(active_tools, "_bg_manager", None) or default_bg_manager)
     )
+    active_bus = bus if bus is not None else getattr(active_tools, "_bus", None)
     # Why: 当外部传入自定义 Mock llm_caller（离线单测或 Demo）且未显式传入 memory_mgr 时，
     # 跳过默认记忆管理器，防止离线测试向真实大模型发起网络请求或写入当前仓库 .agent/memory/。
     active_memory: Optional[MemoryManager]
@@ -474,8 +570,8 @@ def run_agent_turn(
         else:
             local_planning = {"rounds_since_planning": 0}
 
-        # 1. 若非定时任务触发，执行 UserPromptSubmit 前置切面并追加本轮消息
-        if not is_scheduled:
+        # 1. 若非定时或团队后台唤醒，执行 UserPromptSubmit 前置切面并追加本轮消息
+        if not is_scheduled and not is_team_event:
             active_hooks.trigger(HookEvent.USER_PROMPT_SUBMIT, prompt)
         user_content = f"⏰ [定时调度任务触发] {prompt}" if is_scheduled else prompt
         active_messages.append({"role": "user", "content": user_content})
@@ -493,6 +589,7 @@ def run_agent_turn(
             active_messages.insert(0, {"role": "system", "content": refreshed_system})
 
         turns_count = 0
+        turn_tool_calls = 0
         try:
             while True:
                 turns_count += 1
@@ -501,11 +598,18 @@ def run_agent_turn(
                     limit_msg = f"⚠️ 已达到单次调用最大轮数限制 (MAX_TURNS={turn_limit})，强制结束本轮并交还控制权。"
                     if verbose:
                         print(f"\n{limit_msg}")
-                    active_hooks.trigger(HookEvent.STOP, active_messages)
+                    with turn_tool_summary_scope(turn_tool_calls):
+                        active_hooks.trigger(HookEvent.STOP, active_messages)
                     return limit_msg
 
-                # 3. 每次调用大模型前先注入已完成的后台任务通知，再执行四步上下文压缩管线
+                # 3. 每次调用大模型前先注入已完成的后台任务通知与未读团队信箱事件，再执行四步上下文压缩管线
                 active_bg_mgr.inject_notifications(active_messages)
+                # Why: 前台回合（is_team_event=False）每轮都消费 Lead 收件箱；
+                # 团队事件回合（is_team_event=True）若仅做单次快速响应（turns_count <= 2），保留后续新入箱消息
+                # 交由 queue_processor_loop 按事件流分批唤醒；一旦在事件回合内继续多轮跟进（turns_count >= 3），
+                # 同样原子消费收件箱，避免回合内已核验/关机处理完的消息残留导致结束后再次总结。
+                if active_bus is not None and (not is_team_event or turns_count >= 3):
+                    _inject_team_events(active_messages, active_bus)
                 prepared = active_compactor.prepare(active_messages, active_request=active_user_request)
                 if prepared is not active_messages:
                     active_messages[:] = prepared
@@ -537,9 +641,11 @@ def run_agent_turn(
                 if not tool_calls:
                     final_text = str(assistant_dict.get("content") or "")
                     if verbose and final_text:
-                        print(f"\n助手回答:\n{final_text}")
+                        header = "\n🤖 [Lead 团队事件响应]:" if is_team_event else "\n助手回答:"
+                        print(f"{header}\n{final_text}")
 
-                    force_continue = active_hooks.trigger(HookEvent.STOP, active_messages)
+                    with turn_tool_summary_scope(turn_tool_calls):
+                        force_continue = active_hooks.trigger(HookEvent.STOP, active_messages)
                     if force_continue:
                         # Why: 允许 Stop 切面通过返回非 None 提示文本阻止模型提前结束（为 M9 Goal 闭环预留接口）
                         active_messages.append({"role": "user", "content": str(force_continue)})
@@ -555,6 +661,7 @@ def run_agent_turn(
                 compact_requested = False
 
                 for tc in tool_calls:
+                    turn_tool_calls += 1
                     fn_name = tc["function"]["name"]
                     raw_args = tc["function"]["arguments"]
                     parsed_args, parse_err = _parse_tool_arguments(raw_args)
@@ -616,6 +723,65 @@ def run_agent_turn(
                 rounds_since_planning = local_planning["rounds_since_planning"]
 
 
+def _append_user_notification(messages: List[Dict[str, Any]], notification_text: str) -> None:
+    """按 OpenAI 角色时序安全地将异步事件通知并入或追加到上下文末尾。"""
+    if not messages:
+        messages.append({"role": "user", "content": notification_text})
+        return
+
+    last_msg = messages[-1]
+    if isinstance(last_msg, dict) and last_msg.get("role") == "user":
+        orig_content = last_msg.get("content", "")
+        if isinstance(orig_content, str):
+            last_msg["content"] = f"{orig_content}\n\n{notification_text}"
+        elif isinstance(orig_content, list):
+            orig_content.append({"type": "text", "text": notification_text})
+        else:
+            last_msg["content"] = f"{orig_content}\n\n{notification_text}"
+    else:
+        # Why: 最后一条为 tool 或 assistant 时禁止直接塞进前消息，必须另起 user 消息承载通知。
+        messages.append({"role": "user", "content": notification_text})
+
+
+def _inject_team_events(messages: List[Dict[str, Any]], bus: MessageBus) -> int:
+    """在前台回合内原子消费并注入 Lead 未读收件箱消息，返回本次注入的消息条数。"""
+    if not bus.peek("lead"):
+        return 0
+    lead_messages = bus.read_inbox("lead")
+    if not lead_messages:
+        return 0
+    event_text = format_team_events(lead_messages)
+    _append_user_notification(messages, event_text)
+    print(f"📬 \033[35m[Team 信箱同步]\033[0m 已在当前回合消费并注入 {len(lead_messages)} 条队友消息")
+    return len(lead_messages)
+
+
+def format_team_events(inbox_messages: List[Dict[str, Any]]) -> str:
+    """将 Lead 收件箱中的 JSONL 消息格式化为大模型可读的 `[Team events 团队动态事件]` 提示块。"""
+    lines = ["[Team events 团队动态事件]:"]
+    for m in inbox_messages:
+        m_from = m.get("from")
+        m_type = m.get("type")
+        content = m.get("content")
+        meta = m.get("metadata") or {}
+
+        if m_type == "result":
+            lines.append(
+                f"  - 成果回报: 队友 '{m_from}' 完成任务 (Task: {meta.get('task_id')}) -> 总结: {content}"
+            )
+        elif m_type == "idle_notification":
+            lines.append(f"  - 状态就绪: 队友 '{m_from}' 已处于空闲等待状态 (IDLE)")
+        elif m_type == "plan_approval_request":
+            lines.append(
+                f"  - 计划待审: 队友 '{m_from}' 提交了方案 (请求ID: {meta.get('request_id')}): {content}"
+            )
+        elif m_type == "shutdown_response":
+            lines.append(f"  - 关机下线: 队友 '{m_from}' 已安全退出离线")
+        else:
+            lines.append(f"  - 队友消息: 来自 '{m_from}': {content}")
+    return "\n".join(lines)
+
+
 def cron_scheduler_loop(
     stop_event: Optional[threading.Event] = None,
     *,
@@ -637,17 +803,19 @@ def queue_processor_loop(
     stop_event: Optional[threading.Event] = None,
     *,
     cron_mgr: Optional[CronSchedulerManager] = None,
+    bus: Optional[MessageBus] = None,
     lock: Optional[Any] = None,
     turn_runner: Optional[Callable[..., Any]] = None,
     poll_interval: float = 0.2,
 ) -> None:
     """
-    后台事件投递引擎：监听定时调度就绪队列，在主 Agent 空闲时非阻塞抢锁唤醒执行。
+    后台事件投递引擎：同时监听 Cron 触发队列与 Lead 收件箱，在主 Agent 空闲时非阻塞抢锁唤醒执行。
     """
     active_stop = stop_event if stop_event is not None else RUNTIME_STOP
     while not active_stop.wait(poll_interval):
         active_cron = cron_mgr if cron_mgr is not None else default_cron_manager
-        if not active_cron.has_queued_jobs():
+        active_bus = bus if bus is not None else default_bus
+        if not active_cron.has_queued_jobs() and not active_bus.peek("lead"):
             continue
 
         active_lock = lock if lock is not None else agent_lock
@@ -658,6 +826,7 @@ def queue_processor_loop(
 
         runner = turn_runner if turn_runner is not None else run_agent_turn
         try:
+            # 1. 优先处理定时调度任务
             if active_cron.has_queued_jobs():
                 due_jobs = active_cron.consume_queue()
                 for job in due_jobs:
@@ -670,6 +839,28 @@ def queue_processor_loop(
                         # Why: 模型或工具执行失败时立即放回队列并保持 pending_delivery，
                         # 确保调度任务满足 At-Least-Once 交付不丢任务。
                         active_cron.restore_jobs([job])
+
+            # 2. 消费 Lead 收件箱中的团队事件并唤醒 Lead 响应（如计划审批/成果汇总）
+            if active_bus.peek("lead"):
+                lead_messages = active_bus.read_inbox("lead")
+                if lead_messages:
+                    team_event_prompt = format_team_events(lead_messages)
+                    print(
+                        f"\n📬 \033[35m[Team 信箱事件到达]\033[0m 接收到 {len(lead_messages)} 条队友消息，自动唤醒 Lead..."
+                    )
+                    try:
+                        runner(team_event_prompt, is_team_event=True)
+                    except Exception as exc:
+                        print(f"❌ [Lead 处理团队事件异常]: {exc}")
+                        # Why: 回调执行失败时把已消费的 Lead 事件回灌至收件箱，避免队友通知静默丢失
+                        for orig in lead_messages:
+                            active_bus.send(
+                                from_agent=str(orig.get("from", "teammate")),
+                                to_agent="lead",
+                                content=str(orig.get("content", "")),
+                                msg_type=str(orig.get("type", "message")),
+                                metadata=orig.get("metadata") if isinstance(orig.get("metadata"), dict) else None,
+                            )
         finally:
             active_lock.release()
 
@@ -677,12 +868,13 @@ def queue_processor_loop(
 def start_runtime_threads(
     *,
     cron_mgr: Optional[CronSchedulerManager] = None,
+    bus: Optional[MessageBus] = None,
     lock: Optional[Any] = None,
     turn_runner: Optional[Callable[..., Any]] = None,
     scheduler_interval: float = 1.0,
     processor_interval: float = 0.2,
 ) -> List[threading.Thread]:
-    """启动定时巡检 (`cron-scheduler`) 与空闲队列唤醒 (`queue-processor`) 后台守护线程。"""
+    """启动定时巡检 (`cron-scheduler`) 与事件/队列空闲唤醒 (`queue-processor`) 后台守护线程。"""
     if any(t.is_alive() for t in runtime_threads):
         stop_runtime_threads()
 
@@ -699,6 +891,7 @@ def start_runtime_threads(
         args=(RUNTIME_STOP,),
         kwargs={
             "cron_mgr": cron_mgr,
+            "bus": bus,
             "lock": lock,
             "turn_runner": turn_runner,
             "poll_interval": processor_interval,
