@@ -50,9 +50,9 @@ Copy-Item .env.example .env
   - [x] **M4.2**：持久 DAG 任务依赖图 + 主循环集成（`tasks/store.py`, `runtime.py`）
 - **M5：异步后台任务 + Cron 定时调度（每步均接入 `runtime.py`）**
   - [x] **M5.1**：异步后台任务管理与增强 Shell + 主循环集成（`background/`, `runtime.py`）
-  - [ ] **M5.2**：Cron 定时调度引擎 + 并发唤醒线程集成（`cron/`, `runtime.py`, `cli.py`）
+  - [x] **M5.2**：Cron 定时调度引擎 + 并发唤醒线程集成（`cron/`, `runtime.py`, `cli.py`）
 - **M6：多 Agent 团队协同与邮箱通信**
-  - [ ] **M6.1**：离线 JSONL 邮箱与团队审批协议（`teams/bus.py`, `teams/protocol.py`）
+  - [x] **M6.1**：离线 JSONL 邮箱与团队审批协议（`teams/bus.py`, `teams/protocol.py`）
   - [ ] **M6.2**：常驻队友线程、团队工具与主循环收件箱唤醒（`teams/runtime.py`, `teams/tools.py`, `runtime.py`）
 - **M7：MCP 外部插件体系**
   - [ ] **M7.1**：MCP 客户端与内置模拟插件服务（`mcp/client.py`, `mcp/servers.py`）

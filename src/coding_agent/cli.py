@@ -21,6 +21,7 @@ from typing import Any, Dict, List, Optional, Sequence
 
 from coding_agent.config import WORKDIR, configure_utf8_console
 from coding_agent.runtime import (
+    agent_lock,
     create_default_tools,
     create_session_messages,
     default_bg_manager,
@@ -28,6 +29,8 @@ from coding_agent.runtime import (
     default_tools,
     run_agent_turn,
     session_messages,
+    start_runtime_threads,
+    stop_runtime_threads,
 )
 
 
@@ -143,6 +146,7 @@ def run_interactive_repl() -> int:
     print("快捷命令  : 输入 'q' / 'exit' / 'quit' 退出，或运行 `cagent demo` 查看离线演示")
     print("=" * 65)
 
+    start_runtime_threads()
     try:
         while True:
             try:
@@ -159,13 +163,18 @@ def run_interactive_repl() -> int:
 
             snapshot_len = len(session_messages)
             try:
-                run_agent_turn(user_input)
+                # Why: 仅在实际执行本轮交互时持有 agent_lock；等待 input() 期间释放锁，
+                # 以便 queue_processor_loop 在会话空闲时能顺畅唤醒执行到期 Cron 任务。
+                with agent_lock:
+                    run_agent_turn(user_input)
             except Exception as exc:
                 # Why: 本轮如果因 API Key 未配置或网络超时失败，将 session_messages 截断回本轮开始前，
                 # 避免留下孤立的 user 或未闭合的 assistant(tool_calls) 污染后续交互。
-                del session_messages[snapshot_len:]
+                with agent_lock:
+                    del session_messages[snapshot_len:]
                 print(f"\n[执行失败]: {exc}", file=sys.stderr)
     finally:
+        stop_runtime_threads()
         default_bg_manager.cleanup_all()
 
     return 0
@@ -202,7 +211,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     print(f"正在执行单次指令: {single_prompt}")
     print("=" * 60)
     try:
-        run_agent_turn(single_prompt)
+        with agent_lock:
+            run_agent_turn(single_prompt)
     except Exception as exc:
         print(f"\n[执行失败]: {exc}", file=sys.stderr)
         return 1

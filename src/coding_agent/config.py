@@ -171,6 +171,7 @@ MEMORY_DIR: Path = DEFAULT_PATHS.memory_dir
 TASKS_DIR: Path = DEFAULT_PATHS.tasks_dir
 MAILBOX_DIR: Path = DEFAULT_PATHS.mailbox_dir
 WORKFLOW_RUNTIME_DIR: Path = DEFAULT_PATHS.workflow_runtime_dir
+SCHEDULED_TASKS_FILE: Path = AGENT_DIR / "scheduled_tasks.json"
 
 MAX_AGENT_TURNS: int = get_max_turns()
 GOAL_BLOCK_CAP: int = get_goal_block_cap()

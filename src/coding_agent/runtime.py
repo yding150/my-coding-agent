@@ -1,12 +1,12 @@
 """
-runtime.py - Coding Agent 单 Agent 主循环驱动引擎（已集成 M2~M5.1 Hook/Skill/Todo/Context/Memory/Subagent/DAG Tasks/Background）
+runtime.py - Coding Agent 单 Agent 主循环驱动引擎（已集成 M2~M5.2 Hook/Skill/Todo/Context/Memory/Subagent/DAG Tasks/Background/Cron）
 
 架构角色：
     连接“大模型大脑 (`coding_agent.llm`)”、“本地工具手脚 (`coding_agent.tools`)”、
     “生命周期切面门禁 (`coding_agent.hooks`)”、“按需专业技能 (`coding_agent.skills`)”、
     “双轨计划系统 (`coding_agent.tasks`: 会话 Todo + 持久 DAG 任务图)”、“四步上下文压缩 (`coding_agent.context`)”、
-    “跨会话持久记忆 (`coding_agent.memory`)”、“一次性隔离子代理 (`coding_agent.subagent`)”
-    与“异步后台任务 (`coding_agent.background`)”的核心驱动引擎。
+    “跨会话持久记忆 (`coding_agent.memory`)”、“一次性隔离子代理 (`coding_agent.subagent`)”、
+    “异步后台任务 (`coding_agent.background`)”与“Cron 定时调度及并发唤醒 (`coding_agent.cron`)”的核心驱动引擎。
 
 解决的核心痛点：
     1. 将大模型纯文本对话升级为“思考 -> 切面审批/执行工具 -> 观察真实输出 -> 总结回复”的多轮闭环；
@@ -16,19 +16,24 @@ runtime.py - Coding Agent 单 Agent 主循环驱动引擎（已集成 M2~M5.1 Ho
     5. 通过 `MemoryManager` 在会话启动前按需召回 `.agent/memory/` 历史偏好并在结束时提炼落盘；
     6. 通过 `shared_tools` / `parent_tools` 工具分层与 `SubagentRunner`，让主代理经 `task` 外包探索且隔离上下文噪音、杜绝递归套娃；
     7. 通过 `BackgroundTaskManager` 将耗时命令非阻塞派发到后台线程执行，并在后续推理轮次前合法注入 `<task_notification>`；
-    8. 严格遵守 OpenAI `assistant(tool_calls)` 与 `tool(tool_call_id)` 的消息配对协议，并受 `MAX_AGENT_TURNS` 保护。
+    8. 通过 `CronSchedulerManager`、`agent_lock` 互斥锁与 `cron_scheduler_loop`/`queue_processor_loop` 实现会话空闲时的安全定时唤醒与失败回滚；
+    9. 严格遵守 OpenAI `assistant(tool_calls)` 与 `tool(tool_call_id)` 的消息配对协议，并受 `MAX_AGENT_TURNS` 保护。
 
 暴露的核心接口：
-    - `build_system_prompt`: 生成绑定工作区、轻量技能目录、双轨计划分工、异步后台指引与召回记忆的系统提示词
-    - `create_shared_tools` / `create_default_subagent_runner` / `create_default_task_store` / `create_default_bg_manager` / `create_default_tools` / `create_default_hooks` / `create_default_compactor` / `create_default_memory_manager`
-    - `shared_tools` / `parent_tools` / `default_tools` / `default_subagent_runner` / `default_task_store` / `default_bg_manager` / `BG_MANAGER`
+    - `build_system_prompt`: 生成绑定工作区、轻量技能目录、双轨计划分工、后台与定时调度指引及召回记忆的系统提示词
+    - `create_shared_tools` / `create_default_subagent_runner` / `create_default_task_store` / `create_default_bg_manager` / `create_default_cron_manager` / `create_default_tools` / `create_default_hooks` / `create_default_compactor` / `create_default_memory_manager`
+    - `shared_tools` / `parent_tools` / `default_tools` / `default_subagent_runner` / `default_task_store` / `default_bg_manager` / `BG_MANAGER` / `default_cron_manager` / `CRON_MANAGER`
+    - `agent_lock` / `RUNTIME_STOP` / `runtime_threads` / `cron_scheduler_loop` / `queue_processor_loop` / `start_runtime_threads` / `stop_runtime_threads`
     - `execute_tool`: 经由 `PreToolUse` / `PostToolUse` 切面包装的安全工具执行函数
-    - `run_agent_turn`: 执行单次用户提问驱动的多轮工具调用闭环
+    - `run_agent_turn`: 执行单次用户提问或定时唤醒驱动的多轮工具调用闭环
     - `create_session_messages` / `session_messages` / `default_*`
 """
 
 from __future__ import annotations
 
+import threading
+from contextlib import ExitStack
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
@@ -36,6 +41,7 @@ from coding_agent.background import BackgroundTaskManager, register_background_t
 from coding_agent.config import (
     MAX_AGENT_TURNS,
     MEMORY_DIR,
+    SCHEDULED_TASKS_FILE,
     SKILLS_DIR,
     TASKS_DIR,
     TOOL_RESULTS_DIR,
@@ -45,6 +51,7 @@ from coding_agent.config import (
     configure_utf8_console,
 )
 from coding_agent.context import ContextCompactor
+from coding_agent.cron import CronSchedulerManager, register_cron_tools
 from coding_agent.hooks import HookEvent, HookManager, register_default_hooks
 from coding_agent.llm import assistant_message_to_dict, call_llm, parse_tool_arguments
 from coding_agent.memory import MemoryManager
@@ -60,14 +67,24 @@ from coding_agent.tools import ToolManager, register_core_tools
 
 configure_utf8_console()
 
-# 默认技能加载器、双轨计划管理器（Todo + TaskStore）、后台任务管理器、上下文压缩器、跨会话记忆管理器与会话上下文
+# 默认技能加载器、双轨计划管理器、后台与定时调度器、上下文压缩器、跨会话记忆管理器与并发控制原语
 default_skill_loader: SkillLoader = SkillLoader(SKILLS_DIR)
 default_todo_mgr: TodoManager = TodoManager()
 default_task_store: TaskStore = TaskStore(TASKS_DIR, workdir=WORKDIR)
 default_bg_manager: BackgroundTaskManager = BackgroundTaskManager(workdir=WORKDIR)
 BG_MANAGER: BackgroundTaskManager = default_bg_manager
+default_cron_manager: CronSchedulerManager = CronSchedulerManager(
+    workdir=WORKDIR,
+    durable_file=SCHEDULED_TASKS_FILE,
+)
+CRON_MANAGER: CronSchedulerManager = default_cron_manager
 default_compactor: ContextCompactor = ContextCompactor(TRANSCRIPT_DIR, TOOL_RESULTS_DIR)
 default_memory_mgr: MemoryManager = MemoryManager(MEMORY_DIR, workdir=WORKDIR)
+# Why: 前台用户输入、后台 Cron 消费者与未来团队事件线程共享 session_messages，
+# 采用 RLock 允许同一线程内（例如 cli 外层与 run_agent_turn 内部）安全重入，同时跨线程严格互斥。
+agent_lock: threading.RLock = threading.RLock()
+RUNTIME_STOP: threading.Event = threading.Event()
+runtime_threads: List[threading.Thread] = []
 session_messages: List[Dict[str, Any]] = []
 rounds_since_planning: int = 0
 PLANNING_GUARD_THRESHOLD: int = 5
@@ -111,10 +128,11 @@ def build_system_prompt(
             f"2. 规划防漂移：面对多步骤复杂任务，按上述双轨分工选择 `todo_write` 或持久 DAG 任务图管理进度，保持焦点不偏离目标；\n"
             f"3. 隔离子代理调研：遇到需要大范围检索、探索目录结构或读取多份文件的独立子任务，优先调用 `task` 委派一次性子代理在隔离上下文中处理，仅回收精炼摘要；\n"
             f"4. 异步后台命令：运行耗时较长的构建、测试或服务命令时，调用 `run_shell(..., run_in_background=true)` 立即拿到 `bg_xxxx` 并继续并行工作，可用 `check_bg_task` / `list_bg_tasks` / `kill_bg_task` 管理，任务完成后系统会自动注入 `<task_notification>` 通知；\n"
-            f"5. 按需加载技能：若任务命中上方某项专业技能领域，请先调用 `load_skill` 读取完整操作规范后再执行；\n"
-            f"6. 上下文管理：遇到包含 `[Compacted]` 或 `[Emergency Compact]` 的历史压缩通知时，专注当前最新目标；上下文过长时可调用 `compact` 归档历史；\n"
-            f"7. 路径约束：所有文件操作均相对于工作区 {base} 进行；\n"
-            f"8. 实事求是：若工具返回报错，请根据错误信息调整参数重试，并在最终回答中如实汇报结果。"
+            f"5. 定时调度唤醒：当需要周期巡检或定时延迟执行任务时，可通过 `schedule_cron` / `list_crons` / `cancel_cron` 管理五段式 Unix Cron 任务（持久化于 `.agent/scheduled_tasks.json`），到期且会话空闲时系统将自动唤醒执行；\n"
+            f"6. 按需加载技能：若任务命中上方某项专业技能领域，请先调用 `load_skill` 读取完整操作规范后再执行；\n"
+            f"7. 上下文管理：遇到包含 `[Compacted]` 或 `[Emergency Compact]` 的历史压缩通知时，专注当前最新目标；上下文过长时可调用 `compact` 归档历史；\n"
+            f"8. 路径约束：所有文件操作均相对于工作区 {base} 进行；\n"
+            f"9. 实事求是：若工具返回报错，请根据错误信息调整参数重试，并在最终回答中如实汇报结果。"
         )
     ]
 
@@ -191,6 +209,15 @@ def create_default_bg_manager(workdir: Optional[Path] = None) -> BackgroundTaskM
     return BackgroundTaskManager(workdir=target_workdir)
 
 
+def create_default_cron_manager(
+    workdir: Optional[Path] = None,
+    durable_file: Optional[Path] = None,
+) -> CronSchedulerManager:
+    """创建并绑定目标工作区 `.agent/scheduled_tasks.json` 的定时调度管理器。"""
+    target_workdir = (workdir or WORKDIR).resolve()
+    return CronSchedulerManager(workdir=target_workdir, durable_file=durable_file)
+
+
 def create_default_subagent_runner(
     tool_mgr: Optional[ToolManager] = None,
     workdir: Optional[Path] = None,
@@ -214,6 +241,7 @@ def create_default_tools(
     todo_mgr: Optional[TodoManager] = None,
     task_store: Optional[TaskStore] = None,
     bg_mgr: Optional[BackgroundTaskManager] = None,
+    cron_mgr: Optional[CronSchedulerManager] = None,
     subagent_runner: Optional[SubagentRunner] = None,
     shared_tool_mgr: Optional[ToolManager] = None,
 ) -> ToolManager:
@@ -223,6 +251,7 @@ def create_default_tools(
     在 `shared_tools`（5 大核心工具 + `load_skill` + `todo_write`）基础上额外挂载父级专属工具：
         - 计划第二轨：`create_task`, `update_task`, `list_tasks`, `get_task`, `claim_task`, `complete_task`；
         - 异步后台：升级支持 `run_in_background` 的 `run_shell`，并挂载 `check_bg_task`, `kill_bg_task`, `list_bg_tasks`；
+        - 定时调度：`schedule_cron`, `list_crons`, `cancel_cron`；
         - 代理与控制：`compact`, `task`。
     """
     target_workdir = workdir or WORKDIR
@@ -235,8 +264,8 @@ def create_default_tools(
             todo_mgr=todo_mgr,
         )
     )
-    # Why: 从纯净 shared_tools 克隆出新容器再挂载父级工具（DAG + 后台 + compact + task），
-    # 既确保传入的 shared_tool_mgr 不被原地污染，也防止同步子代理误触父级图或启动长后台进程。
+    # Why: 从纯净 shared_tools 克隆出新容器再挂载父级工具（DAG + 后台 + Cron + compact + task），
+    # 既确保传入的 shared_tool_mgr 不被原地污染，也防止同步子代理误注册定时任务或启动长后台进程。
     manager = base_shared.clone()
 
     active_task_store = (
@@ -254,6 +283,13 @@ def create_default_tools(
     register_background_tools(manager, active_bg_mgr)
     # Why: 在工具集上保留所属后台管理器引用，使仅传入 tools 的主循环/单测也能精准注入该工作区的完成通知
     setattr(manager, "_bg_manager", active_bg_mgr)
+
+    active_cron_mgr = (
+        cron_mgr
+        if cron_mgr is not None
+        else create_default_cron_manager(workdir=target_workdir)
+    )
+    register_cron_tools(manager, active_cron_mgr)
 
     @manager.register(
         name="compact",
@@ -295,6 +331,7 @@ parent_tools: ToolManager = create_default_tools(
     todo_mgr=default_todo_mgr,
     task_store=default_task_store,
     bg_mgr=default_bg_manager,
+    cron_mgr=default_cron_manager,
     subagent_runner=default_subagent_runner,
     shared_tool_mgr=shared_tools,
 )
@@ -354,15 +391,18 @@ def run_agent_turn(
     compactor: Optional[ContextCompactor] = None,
     memory_mgr: Optional[MemoryManager] = None,
     bg_mgr: Optional[BackgroundTaskManager] = None,
+    cron_mgr: Optional[CronSchedulerManager] = None,
     planning_state: Optional[Dict[str, int]] = None,
     max_turns: Optional[int] = None,
+    is_scheduled: bool = False,
+    lock: Optional[Any] = None,
     verbose: bool = True,
 ) -> str:
     """
-    执行一次用户输入触发的单 Agent 闭环（核心 `while True` 工具循环 + Hook + Skill + 双轨计划 + Context + Memory + Subagent + Background）。
+    执行一次用户输入或定时调度触发的单 Agent 闭环（核心 `while True` 工具循环 + 全套运行时子系统）。
 
     运行流程：
-        1. 触发 `UserPromptSubmit` 切面并追加 `user` 消息；
+        1. 若非定时唤醒，触发 `UserPromptSubmit` 切面；追加 `user` 消息（定时任务带 `⏰` 前缀）；
         2. 会话启动前按需召回跨会话记忆并刷新顶部 `system` 提示词；
         3. 每次调用大模型前注入已就绪的 `<task_notification>` 后台通知，并执行 `ContextCompactor.prepare()` 四步压缩管线；
         4. 调用大模型（携带 `tools.get_schemas()`），遇上下文超长异常则执行 `reactive_compact` 自愈重试；
@@ -373,7 +413,7 @@ def run_agent_turn(
         7. 执行连续未规划守卫（`rounds_since_planning >= 5`）以及主动 `compact` 归档裁剪；
         8. 回到步骤 3 让模型“看见”工具结果，直到给出最终回复或触发 `max_turns` 上限保护。
 
-    :param prompt: 用户本轮输入的自然语言指令。
+    :param prompt: 用户本轮输入的自然语言指令或定时任务提示词。
     :param tools: 工具管理器，默认使用绑定 `WORKDIR` 的 `default_tools`。
     :param hooks: 生命周期钩子管理器，默认使用 `default_hooks`。
     :param messages: 对话消息列表（原地追加更新），默认使用模块级 `session_messages`。
@@ -384,16 +424,19 @@ def run_agent_turn(
     :param compactor: 可选上下文压缩器；默认使用绑定 `.agent/` 目录的 `default_compactor`。
     :param memory_mgr: 可选跨会话记忆管理器；使用默认 `call_llm` 时默认启用 `default_memory_mgr`。
     :param bg_mgr: 可选异步后台任务管理器；未传时优先复用 `tools` 关联的后台管理器，否则回退 `default_bg_manager`。
+    :param cron_mgr: 可选 Cron 定时调度管理器（语义对齐参数，实际工具由 `tools` 装配持有）。
     :param planning_state: 可选的连续未规划计数字典 `{"rounds_since_planning": int}`；
         传入自定义 `messages` 时默认隔离新建，未传 `messages` 时默认使用模块级计数器。
     :param max_turns: 单次用户提问最多允许的模型调用轮数，默认取 `MAX_AGENT_TURNS`。
+    :param is_scheduled: 是否来自 `queue_processor_loop` 的后台 Cron 定时唤醒。
+    :param lock: 可选显式并发互斥锁；默认会话（`messages=None`）会自动受 `agent_lock` 保护。
     :param verbose: 是否向终端打印工具调用与助手回答过程。
     :return: 模型最终输出的回复文本（若超限则返回提示文本）。
     """
     global rounds_since_planning
 
-    # 显式保留 todo_mgr 语义入参供未来会话重构对齐，当前由 tools 中的 todo_write 闭包持有
-    _ = todo_mgr
+    # 显式保留 todo_mgr / cron_mgr 语义入参供未来会话重构对齐，当前由 tools 闭包持有
+    _ = (todo_mgr, cron_mgr)
     active_tools = tools if tools is not None else default_tools
     active_hooks = hooks if hooks is not None else default_hooks
     active_compactor = compactor if compactor is not None else default_compactor
@@ -417,149 +460,262 @@ def run_agent_turn(
     turn_limit = max_turns if max_turns is not None else MAX_AGENT_TURNS
     active_user_request = prompt
 
-    # Why: 当使用默认全局 REPL 会话时延续跨轮次计数器；当测试传入隔离 messages 时使用独立计数器避免串扰
-    if planning_state is not None:
-        local_planning = planning_state
-    elif use_default_session:
-        local_planning = {"rounds_since_planning": rounds_since_planning}
-    else:
-        local_planning = {"rounds_since_planning": 0}
+    active_lock = lock if lock is not None else (agent_lock if use_default_session else None)
 
-    # 1. 触发 UserPromptSubmit 前置切面并追加本轮用户输入
-    active_hooks.trigger(HookEvent.USER_PROMPT_SUBMIT, prompt)
-    active_messages.append({"role": "user", "content": prompt})
+    with ExitStack() as lock_stack:
+        if active_lock is not None:
+            lock_stack.enter_context(active_lock)
+
+        # Why: 当使用默认全局 REPL 会话时延续跨轮次计数器；当测试传入隔离 messages 时使用独立计数器避免串扰
+        if planning_state is not None:
+            local_planning = planning_state
+        elif use_default_session:
+            local_planning = {"rounds_since_planning": rounds_since_planning}
+        else:
+            local_planning = {"rounds_since_planning": 0}
+
+        # 1. 若非定时任务触发，执行 UserPromptSubmit 前置切面并追加本轮消息
+        if not is_scheduled:
+            active_hooks.trigger(HookEvent.USER_PROMPT_SUBMIT, prompt)
+        user_content = f"⏰ [定时调度任务触发] {prompt}" if is_scheduled else prompt
+        active_messages.append({"role": "user", "content": user_content})
 
     # 2. 会话前相关记忆召回并刷新第 0 条 system 提示词（此时消息列表已含最新 user 提问，便于按需检索）
-    relevant_memories = active_memory.load_memories(active_messages) if active_memory is not None else ""
-    refreshed_system = build_system_prompt(
-        workdir=workdir,
-        skill_loader=skill_loader,
-        relevant_memories=relevant_memories,
-    )
-    if active_messages and active_messages[0].get("role") == "system":
-        active_messages[0]["content"] = refreshed_system
-    else:
-        active_messages.insert(0, {"role": "system", "content": refreshed_system})
+        relevant_memories = active_memory.load_memories(active_messages) if active_memory is not None else ""
+        refreshed_system = build_system_prompt(
+            workdir=workdir,
+            skill_loader=skill_loader,
+            relevant_memories=relevant_memories,
+        )
+        if active_messages and active_messages[0].get("role") == "system":
+            active_messages[0]["content"] = refreshed_system
+        else:
+            active_messages.insert(0, {"role": "system", "content": refreshed_system})
 
-    turns_count = 0
-    try:
-        while True:
-            turns_count += 1
-            # Why: 必须限制单次对话的最大循环轮数，防止模型陷入“反复调工具不收敛”的死循环
-            if turns_count > turn_limit:
-                limit_msg = f"⚠️ 已达到单次调用最大轮数限制 (MAX_TURNS={turn_limit})，强制结束本轮并交还控制权。"
-                if verbose:
-                    print(f"\n{limit_msg}")
-                active_hooks.trigger(HookEvent.STOP, active_messages)
-                return limit_msg
+        turns_count = 0
+        try:
+            while True:
+                turns_count += 1
+                # Why: 必须限制单次对话的最大循环轮数，防止模型陷入“反复调工具不收敛”的死循环
+                if turns_count > turn_limit:
+                    limit_msg = f"⚠️ 已达到单次调用最大轮数限制 (MAX_TURNS={turn_limit})，强制结束本轮并交还控制权。"
+                    if verbose:
+                        print(f"\n{limit_msg}")
+                    active_hooks.trigger(HookEvent.STOP, active_messages)
+                    return limit_msg
 
-            # 3. 每次调用大模型前先注入已完成的后台任务通知，再执行四步上下文压缩管线
-            active_bg_mgr.inject_notifications(active_messages)
-            prepared = active_compactor.prepare(active_messages, active_request=active_user_request)
-            if prepared is not active_messages:
-                active_messages[:] = prepared
+                # 3. 每次调用大模型前先注入已完成的后台任务通知，再执行四步上下文压缩管线
+                active_bg_mgr.inject_notifications(active_messages)
+                prepared = active_compactor.prepare(active_messages, active_request=active_user_request)
+                if prepared is not active_messages:
+                    active_messages[:] = prepared
 
-            # 4. 携带当前工具的 OpenAI Schema 调用大模型，遇上下文超长时触发响应式应急压缩重试
-            schemas = active_tools.get_schemas()
-            try:
-                response_msg = llm_caller(messages=active_messages, tools=schemas)
-            except Exception as exc:
-                err_text = str(exc).lower()
-                if any(k in err_text for k in ("prompt_too_long", "context_length_exceeded", "too many tokens")):
+                # 4. 携带当前工具的 OpenAI Schema 调用大模型，遇上下文超长时触发响应式应急压缩重试
+                schemas = active_tools.get_schemas()
+                try:
+                    response_msg = llm_caller(messages=active_messages, tools=schemas)
+                except Exception as exc:
+                    err_text = str(exc).lower()
+                    if any(k in err_text for k in ("prompt_too_long", "context_length_exceeded", "too many tokens")):
+                        rebuilt = active_compactor.reactive_compact(
+                            active_messages,
+                            active_request=active_user_request,
+                        )
+                        if rebuilt is not active_messages:
+                            active_messages[:] = rebuilt
+                        response_msg = llm_caller(messages=active_messages, tools=schemas)
+                    else:
+                        raise
+
+                # 5. 无论模型是否调用工具，都必须先把这条 assistant 消息追加进对话历史
+                assistant_dict = _assistant_message_to_dict(response_msg)
+                active_messages.append(assistant_dict)
+
+                tool_calls = assistant_dict.get("tool_calls") or []
+
+                # 6. 退出条件：模型没有发起任何 tool_calls，触发 Stop 切面裁决后结束或续轮
+                if not tool_calls:
+                    final_text = str(assistant_dict.get("content") or "")
+                    if verbose and final_text:
+                        print(f"\n助手回答:\n{final_text}")
+
+                    force_continue = active_hooks.trigger(HookEvent.STOP, active_messages)
+                    if force_continue:
+                        # Why: 允许 Stop 切面通过返回非 None 提示文本阻止模型提前结束（为 M9 Goal 闭环预留接口）
+                        active_messages.append({"role": "user", "content": str(force_continue)})
+                        continue
+
+                    if active_memory is not None:
+                        if active_memory.extract_memories(active_messages):
+                            active_memory.consolidate_memories()
+                    return final_text
+
+                # 7. 经过 PreToolUse / PostToolUse 切面执行每个工具，并按 tool_call_id 配对回填 role="tool"
+                used_planning_in_this_round = False
+                compact_requested = False
+
+                for tc in tool_calls:
+                    fn_name = tc["function"]["name"]
+                    raw_args = tc["function"]["arguments"]
+                    parsed_args, parse_err = _parse_tool_arguments(raw_args)
+
+                    if fn_name in PLANNING_TOOLS:
+                        used_planning_in_this_round = True
+                    if fn_name == "compact":
+                        compact_requested = True
+
+                    if parse_err is not None:
+                        # Why: 即使 JSON 解析失败，也必须回填一条对应的 role="tool" 消息，
+                        # 否则下一轮调用 OpenAI API 会因“存在未响应的 tool_call_id”而报 400 错误。
+                        tool_output = parse_err
+                        if verbose:
+                            print(f"\n[工具参数异常]: {fn_name} -> {tool_output}")
+                    else:
+                        # if verbose:
+                        #     print(f"\n[调用工具]: {fn_name}({parsed_args})")q
+                        tool_output = execute_tool(fn_name, parsed_args, active_tools, hook_mgr=active_hooks)
+
+                    if verbose:
+                        preview = tool_output[:400] + ("..." if len(tool_output) > 400 else "")
+                        print(f"[工具输出]:\n{preview}")
+
+                    active_messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tc["id"],
+                            "content": tool_output,
+                        }
+                    )
+
+                # 8. 连续未更新计划守卫：一旦连续 5 轮工具调用均未规划，注入轻量纠偏提醒并清零计数
+                if used_planning_in_this_round:
+                    local_planning["rounds_since_planning"] = 0
+                else:
+                    local_planning["rounds_since_planning"] += 1
+
+                if local_planning["rounds_since_planning"] >= PLANNING_GUARD_THRESHOLD:
+                    nudge = (
+                        f"[系统守卫提示]: 您已经连续 {PLANNING_GUARD_THRESHOLD} 轮未更新任务计划。"
+                        "请使用 todo_write 或持久 DAG 任务图工具（create_task / claim_task / complete_task）梳理或更新当前步骤，防止长链条执行偏离目标。"
+                    )
+                    active_messages.append({"role": "user", "content": nudge})
+                    local_planning["rounds_since_planning"] = 0
+
+                # 9. 若模型主动调用了 compact 工具，在本轮工具回填后立即执行历史归档与裁剪
+                if compact_requested:
+                    if verbose:
+                        print("\n🧹 [Context 压缩] 主动压缩生效，正在执行会话历史归档与裁剪...")
                     rebuilt = active_compactor.reactive_compact(
                         active_messages,
                         active_request=active_user_request,
                     )
                     if rebuilt is not active_messages:
                         active_messages[:] = rebuilt
-                    response_msg = llm_caller(messages=active_messages, tools=schemas)
-                else:
-                    raise
+        finally:
+            if use_default_session and planning_state is None:
+                rounds_since_planning = local_planning["rounds_since_planning"]
 
-            # 5. 无论模型是否调用工具，都必须先把这条 assistant 消息追加进对话历史
-            assistant_dict = _assistant_message_to_dict(response_msg)
-            active_messages.append(assistant_dict)
 
-            tool_calls = assistant_dict.get("tool_calls") or []
+def cron_scheduler_loop(
+    stop_event: Optional[threading.Event] = None,
+    *,
+    cron_mgr: Optional[CronSchedulerManager] = None,
+    poll_interval: float = 1.0,
+    now_fn: Callable[[], datetime] = datetime.now,
+) -> None:
+    """定时调度轮询后台线程：按周期巡检到期 Cron 任务并推送至待交付队列。"""
+    active_stop = stop_event if stop_event is not None else RUNTIME_STOP
+    while not active_stop.wait(poll_interval):
+        active_cron = cron_mgr if cron_mgr is not None else default_cron_manager
+        try:
+            active_cron.poll_due_jobs(now_fn())
+        except Exception as exc:
+            print(f"❌ [Cron 轮询异常]: {exc}")
 
-            # 6. 退出条件：模型没有发起任何 tool_calls，触发 Stop 切面裁决后结束或续轮
-            if not tool_calls:
-                final_text = str(assistant_dict.get("content") or "")
-                if verbose and final_text:
-                    print(f"\n助手回答:\n{final_text}")
 
-                force_continue = active_hooks.trigger(HookEvent.STOP, active_messages)
-                if force_continue:
-                    # Why: 允许 Stop 切面通过返回非 None 提示文本阻止模型提前结束（为 M9 Goal 闭环预留接口）
-                    active_messages.append({"role": "user", "content": str(force_continue)})
-                    continue
+def queue_processor_loop(
+    stop_event: Optional[threading.Event] = None,
+    *,
+    cron_mgr: Optional[CronSchedulerManager] = None,
+    lock: Optional[Any] = None,
+    turn_runner: Optional[Callable[..., Any]] = None,
+    poll_interval: float = 0.2,
+) -> None:
+    """
+    后台事件投递引擎：监听定时调度就绪队列，在主 Agent 空闲时非阻塞抢锁唤醒执行。
+    """
+    active_stop = stop_event if stop_event is not None else RUNTIME_STOP
+    while not active_stop.wait(poll_interval):
+        active_cron = cron_mgr if cron_mgr is not None else default_cron_manager
+        if not active_cron.has_queued_jobs():
+            continue
 
-                if active_memory is not None:
-                    if active_memory.extract_memories(active_messages):
-                        active_memory.consolidate_memories()
-                return final_text
+        active_lock = lock if lock is not None else agent_lock
+        # Why: 必须使用非阻塞 acquire(blocking=False)，若前台用户输入正在执行，后台消费线程
+        # 立即跳过等待下次轮询，避免后台堆积阻塞，也防止竞态破坏共享会话消息。
+        if not active_lock.acquire(blocking=False):
+            continue
 
-            # 7. 经过 PreToolUse / PostToolUse 切面执行每个工具，并按 tool_call_id 配对回填 role="tool"
-            used_planning_in_this_round = False
-            compact_requested = False
+        runner = turn_runner if turn_runner is not None else run_agent_turn
+        try:
+            if active_cron.has_queued_jobs():
+                due_jobs = active_cron.consume_queue()
+                for job in due_jobs:
+                    print(f"\n⏰ \033[36m[Cron 定时唤醒]\033[0m 启动定时任务 {job.id}: '{job.prompt}'")
+                    try:
+                        runner(job.prompt, is_scheduled=True)
+                        active_cron.acknowledge_jobs([job])
+                    except Exception as exc:
+                        print(f"❌ [Cron 执行异常] {job.id}: {exc}")
+                        # Why: 模型或工具执行失败时立即放回队列并保持 pending_delivery，
+                        # 确保调度任务满足 At-Least-Once 交付不丢任务。
+                        active_cron.restore_jobs([job])
+        finally:
+            active_lock.release()
 
-            for tc in tool_calls:
-                fn_name = tc["function"]["name"]
-                raw_args = tc["function"]["arguments"]
-                parsed_args, parse_err = _parse_tool_arguments(raw_args)
 
-                if fn_name in PLANNING_TOOLS:
-                    used_planning_in_this_round = True
-                if fn_name == "compact":
-                    compact_requested = True
+def start_runtime_threads(
+    *,
+    cron_mgr: Optional[CronSchedulerManager] = None,
+    lock: Optional[Any] = None,
+    turn_runner: Optional[Callable[..., Any]] = None,
+    scheduler_interval: float = 1.0,
+    processor_interval: float = 0.2,
+) -> List[threading.Thread]:
+    """启动定时巡检 (`cron-scheduler`) 与空闲队列唤醒 (`queue-processor`) 后台守护线程。"""
+    if any(t.is_alive() for t in runtime_threads):
+        stop_runtime_threads()
 
-                if parse_err is not None:
-                    # Why: 即使 JSON 解析失败，也必须回填一条对应的 role="tool" 消息，
-                    # 否则下一轮调用 OpenAI API 会因“存在未响应的 tool_call_id”而报 400 错误。
-                    tool_output = parse_err
-                    if verbose:
-                        print(f"\n[工具参数异常]: {fn_name} -> {tool_output}")
-                else:
-                    # if verbose:
-                    #     print(f"\n[调用工具]: {fn_name}({parsed_args})")q
-                    tool_output = execute_tool(fn_name, parsed_args, active_tools, hook_mgr=active_hooks)
+    RUNTIME_STOP.clear()
+    t_scheduler = threading.Thread(
+        target=cron_scheduler_loop,
+        args=(RUNTIME_STOP,),
+        kwargs={"cron_mgr": cron_mgr, "poll_interval": scheduler_interval},
+        name="cron-scheduler",
+        daemon=True,
+    )
+    t_processor = threading.Thread(
+        target=queue_processor_loop,
+        args=(RUNTIME_STOP,),
+        kwargs={
+            "cron_mgr": cron_mgr,
+            "lock": lock,
+            "turn_runner": turn_runner,
+            "poll_interval": processor_interval,
+        },
+        name="queue-processor",
+        daemon=True,
+    )
+    runtime_threads.extend([t_scheduler, t_processor])
+    for t in runtime_threads:
+        t.start()
+    return list(runtime_threads)
 
-                if verbose:
-                    preview = tool_output[:400] + ("..." if len(tool_output) > 400 else "")
-                    print(f"[工具输出]:\n{preview}")
 
-                active_messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": tc["id"],
-                        "content": tool_output,
-                    }
-                )
-
-            # 8. 连续未更新计划守卫：一旦连续 5 轮工具调用均未规划，注入轻量纠偏提醒并清零计数
-            if used_planning_in_this_round:
-                local_planning["rounds_since_planning"] = 0
-            else:
-                local_planning["rounds_since_planning"] += 1
-
-            if local_planning["rounds_since_planning"] >= PLANNING_GUARD_THRESHOLD:
-                nudge = (
-                    f"[系统守卫提示]: 您已经连续 {PLANNING_GUARD_THRESHOLD} 轮未更新任务计划。"
-                    "请使用 todo_write 或持久 DAG 任务图工具（create_task / claim_task / complete_task）梳理或更新当前步骤，防止长链条执行偏离目标。"
-                )
-                active_messages.append({"role": "user", "content": nudge})
-                local_planning["rounds_since_planning"] = 0
-
-            # 9. 若模型主动调用了 compact 工具，在本轮工具回填后立即执行历史归档与裁剪
-            if compact_requested:
-                if verbose:
-                    print("\n🧹 [Context 压缩] 主动压缩生效，正在执行会话历史归档与裁剪...")
-                rebuilt = active_compactor.reactive_compact(
-                    active_messages,
-                    active_request=active_user_request,
-                )
-                if rebuilt is not active_messages:
-                    active_messages[:] = rebuilt
-    finally:
-        if use_default_session and planning_state is None:
-            rounds_since_planning = local_planning["rounds_since_planning"]
+def stop_runtime_threads() -> None:
+    """安全通知并等待 `cron-scheduler` 与 `queue-processor` 后台线程停止退出。"""
+    RUNTIME_STOP.set()
+    for t in runtime_threads:
+        if t.is_alive():
+            t.join(timeout=1.0)
+    runtime_threads.clear()
