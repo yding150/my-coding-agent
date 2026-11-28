@@ -49,7 +49,7 @@ Copy-Item .env.example .env
   - [x] **M4.1**：一次性隔离子代理 + 主循环集成（`subagent/`, `runtime.py`）
   - [x] **M4.2**：持久 DAG 任务依赖图 + 主循环集成（`tasks/store.py`, `runtime.py`）
 - **M5：异步后台任务 + Cron 定时调度（每步均接入 `runtime.py`）**
-  - [ ] **M5.1**：异步后台任务管理与增强 Shell + 主循环集成（`background/`, `runtime.py`）
+  - [x] **M5.1**：异步后台任务管理与增强 Shell + 主循环集成（`background/`, `runtime.py`）
   - [ ] **M5.2**：Cron 定时调度引擎 + 并发唤醒线程集成（`cron/`, `runtime.py`, `cli.py`）
 - **M6：多 Agent 团队协同与邮箱通信**
   - [ ] **M6.1**：离线 JSONL 邮箱与团队审批协议（`teams/bus.py`, `teams/protocol.py`）

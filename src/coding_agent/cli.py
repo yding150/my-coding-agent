@@ -23,6 +23,7 @@ from coding_agent.config import WORKDIR, configure_utf8_console
 from coding_agent.runtime import (
     create_default_tools,
     create_session_messages,
+    default_bg_manager,
     default_skill_loader,
     default_tools,
     run_agent_turn,
@@ -111,14 +112,19 @@ def run_demo_mode() -> int:
         user_prompt = "列出当前目录文件并创建一个测试文件 hello_agent.txt"
         print(f"用户指令: {user_prompt}")
         print(f"演示沙箱: {demo_workdir} (退出后自动清理)")
-        run_agent_turn(
-            user_prompt,
-            tools=demo_tools,
-            messages=demo_messages,
-            llm_caller=scripted_llm,
-            workdir=demo_workdir,
-            verbose=True,
-        )
+        try:
+            run_agent_turn(
+                user_prompt,
+                tools=demo_tools,
+                messages=demo_messages,
+                llm_caller=scripted_llm,
+                workdir=demo_workdir,
+                verbose=True,
+            )
+        finally:
+            demo_bg = getattr(demo_tools, "_bg_manager", None)
+            if demo_bg is not None:
+                demo_bg.cleanup_all()
 
     print("\n" + "=" * 65)
     print("Demo 演示结束：共经历 3 轮模型调用完成“列目录 -> 写文件 -> 校验 -> 总结”闭环。")
@@ -137,27 +143,30 @@ def run_interactive_repl() -> int:
     print("快捷命令  : 输入 'q' / 'exit' / 'quit' 退出，或运行 `cagent demo` 查看离线演示")
     print("=" * 65)
 
-    while True:
-        try:
-            user_input = input("\n用户输入>> ").strip()
-        except (KeyboardInterrupt, EOFError):
-            print("\n会话已终止。")
-            break
+    try:
+        while True:
+            try:
+                user_input = input("\n用户输入>> ").strip()
+            except (KeyboardInterrupt, EOFError):
+                print("\n会话已终止。")
+                break
 
-        if not user_input:
-            continue
-        if user_input.lower() in {"q", "exit", "quit"}:
-            print("再见！")
-            break
+            if not user_input:
+                continue
+            if user_input.lower() in {"q", "exit", "quit"}:
+                print("再见！")
+                break
 
-        snapshot_len = len(session_messages)
-        try:
-            run_agent_turn(user_input)
-        except Exception as exc:
-            # Why: 本轮如果因 API Key 未配置或网络超时失败，将 session_messages 截断回本轮开始前，
-            # 避免留下孤立的 user 或未闭合的 assistant(tool_calls) 污染后续交互。
-            del session_messages[snapshot_len:]
-            print(f"\n[执行失败]: {exc}", file=sys.stderr)
+            snapshot_len = len(session_messages)
+            try:
+                run_agent_turn(user_input)
+            except Exception as exc:
+                # Why: 本轮如果因 API Key 未配置或网络超时失败，将 session_messages 截断回本轮开始前，
+                # 避免留下孤立的 user 或未闭合的 assistant(tool_calls) 污染后续交互。
+                del session_messages[snapshot_len:]
+                print(f"\n[执行失败]: {exc}", file=sys.stderr)
+    finally:
+        default_bg_manager.cleanup_all()
 
     return 0
 
@@ -197,6 +206,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     except Exception as exc:
         print(f"\n[执行失败]: {exc}", file=sys.stderr)
         return 1
+    finally:
+        default_bg_manager.cleanup_all()
     return 0
 
 

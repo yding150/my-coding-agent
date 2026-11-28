@@ -1,11 +1,12 @@
 """
-runtime.py - Coding Agent 单 Agent 主循环驱动引擎（已集成 M2~M4.2 Hook/Skill/Todo/Context/Memory/Subagent/DAG Tasks）
+runtime.py - Coding Agent 单 Agent 主循环驱动引擎（已集成 M2~M5.1 Hook/Skill/Todo/Context/Memory/Subagent/DAG Tasks/Background）
 
 架构角色：
     连接“大模型大脑 (`coding_agent.llm`)”、“本地工具手脚 (`coding_agent.tools`)”、
     “生命周期切面门禁 (`coding_agent.hooks`)”、“按需专业技能 (`coding_agent.skills`)”、
     “双轨计划系统 (`coding_agent.tasks`: 会话 Todo + 持久 DAG 任务图)”、“四步上下文压缩 (`coding_agent.context`)”、
-    “跨会话持久记忆 (`coding_agent.memory`)”与“一次性隔离子代理 (`coding_agent.subagent`)”的核心驱动引擎。
+    “跨会话持久记忆 (`coding_agent.memory`)”、“一次性隔离子代理 (`coding_agent.subagent`)”
+    与“异步后台任务 (`coding_agent.background`)”的核心驱动引擎。
 
 解决的核心痛点：
     1. 将大模型纯文本对话升级为“思考 -> 切面审批/执行工具 -> 观察真实输出 -> 总结回复”的多轮闭环；
@@ -14,12 +15,13 @@ runtime.py - Coding Agent 单 Agent 主循环驱动引擎（已集成 M2~M4.2 Ho
     4. 通过 `ContextCompactor` 四步压缩与 `reactive_compact` 防止上下文超限崩溃，支持 `compact` 主动归档至 `.agent/transcripts/`；
     5. 通过 `MemoryManager` 在会话启动前按需召回 `.agent/memory/` 历史偏好并在结束时提炼落盘；
     6. 通过 `shared_tools` / `parent_tools` 工具分层与 `SubagentRunner`，让主代理经 `task` 外包探索且隔离上下文噪音、杜绝递归套娃；
-    7. 严格遵守 OpenAI `assistant(tool_calls)` 与 `tool(tool_call_id)` 的消息配对协议，并受 `MAX_AGENT_TURNS` 保护。
+    7. 通过 `BackgroundTaskManager` 将耗时命令非阻塞派发到后台线程执行，并在后续推理轮次前合法注入 `<task_notification>`；
+    8. 严格遵守 OpenAI `assistant(tool_calls)` 与 `tool(tool_call_id)` 的消息配对协议，并受 `MAX_AGENT_TURNS` 保护。
 
 暴露的核心接口：
-    - `build_system_prompt`: 生成绑定工作区、轻量技能目录、双轨计划分工、上下文规则与召回记忆的系统提示词
-    - `create_shared_tools` / `create_default_subagent_runner` / `create_default_task_store` / `create_default_tools` / `create_default_hooks` / `create_default_compactor` / `create_default_memory_manager`
-    - `shared_tools` / `parent_tools` / `default_tools` / `default_subagent_runner` / `default_task_store`
+    - `build_system_prompt`: 生成绑定工作区、轻量技能目录、双轨计划分工、异步后台指引与召回记忆的系统提示词
+    - `create_shared_tools` / `create_default_subagent_runner` / `create_default_task_store` / `create_default_bg_manager` / `create_default_tools` / `create_default_hooks` / `create_default_compactor` / `create_default_memory_manager`
+    - `shared_tools` / `parent_tools` / `default_tools` / `default_subagent_runner` / `default_task_store` / `default_bg_manager` / `BG_MANAGER`
     - `execute_tool`: 经由 `PreToolUse` / `PostToolUse` 切面包装的安全工具执行函数
     - `run_agent_turn`: 执行单次用户提问驱动的多轮工具调用闭环
     - `create_session_messages` / `session_messages` / `default_*`
@@ -30,6 +32,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
+from coding_agent.background import BackgroundTaskManager, register_background_tools
 from coding_agent.config import (
     MAX_AGENT_TURNS,
     MEMORY_DIR,
@@ -57,10 +60,12 @@ from coding_agent.tools import ToolManager, register_core_tools
 
 configure_utf8_console()
 
-# 默认技能加载器、双轨计划管理器（Todo + TaskStore）、上下文压缩器、跨会话记忆管理器与会话上下文（P2 再收拢为 AgentSession）
+# 默认技能加载器、双轨计划管理器（Todo + TaskStore）、后台任务管理器、上下文压缩器、跨会话记忆管理器与会话上下文
 default_skill_loader: SkillLoader = SkillLoader(SKILLS_DIR)
 default_todo_mgr: TodoManager = TodoManager()
 default_task_store: TaskStore = TaskStore(TASKS_DIR, workdir=WORKDIR)
+default_bg_manager: BackgroundTaskManager = BackgroundTaskManager(workdir=WORKDIR)
+BG_MANAGER: BackgroundTaskManager = default_bg_manager
 default_compactor: ContextCompactor = ContextCompactor(TRANSCRIPT_DIR, TOOL_RESULTS_DIR)
 default_memory_mgr: MemoryManager = MemoryManager(MEMORY_DIR, workdir=WORKDIR)
 session_messages: List[Dict[str, Any]] = []
@@ -105,10 +110,11 @@ def build_system_prompt(
             f"1. 行动优先：查看文件、列目录、修改代码或验证结果时，直接调用工具获取真实信息，不要凭空猜测；\n"
             f"2. 规划防漂移：面对多步骤复杂任务，按上述双轨分工选择 `todo_write` 或持久 DAG 任务图管理进度，保持焦点不偏离目标；\n"
             f"3. 隔离子代理调研：遇到需要大范围检索、探索目录结构或读取多份文件的独立子任务，优先调用 `task` 委派一次性子代理在隔离上下文中处理，仅回收精炼摘要；\n"
-            f"4. 按需加载技能：若任务命中上方某项专业技能领域，请先调用 `load_skill` 读取完整操作规范后再执行；\n"
-            f"5. 上下文管理：遇到包含 `[Compacted]` 或 `[Emergency Compact]` 的历史压缩通知时，专注当前最新目标；上下文过长时可调用 `compact` 归档历史；\n"
-            f"6. 路径约束：所有文件操作均相对于工作区 {base} 进行；\n"
-            f"7. 实事求是：若工具返回报错，请根据错误信息调整参数重试，并在最终回答中如实汇报结果。"
+            f"4. 异步后台命令：运行耗时较长的构建、测试或服务命令时，调用 `run_shell(..., run_in_background=true)` 立即拿到 `bg_xxxx` 并继续并行工作，可用 `check_bg_task` / `list_bg_tasks` / `kill_bg_task` 管理，任务完成后系统会自动注入 `<task_notification>` 通知；\n"
+            f"5. 按需加载技能：若任务命中上方某项专业技能领域，请先调用 `load_skill` 读取完整操作规范后再执行；\n"
+            f"6. 上下文管理：遇到包含 `[Compacted]` 或 `[Emergency Compact]` 的历史压缩通知时，专注当前最新目标；上下文过长时可调用 `compact` 归档历史；\n"
+            f"7. 路径约束：所有文件操作均相对于工作区 {base} 进行；\n"
+            f"8. 实事求是：若工具返回报错，请根据错误信息调整参数重试，并在最终回答中如实汇报结果。"
         )
     ]
 
@@ -179,6 +185,12 @@ def create_default_task_store(
     return TaskStore(directory=target_dir, workdir=target_workdir)
 
 
+def create_default_bg_manager(workdir: Optional[Path] = None) -> BackgroundTaskManager:
+    """创建并绑定目标工作区的异步后台任务管理器（`BackgroundTaskManager`）。"""
+    target_workdir = (workdir or WORKDIR).resolve()
+    return BackgroundTaskManager(workdir=target_workdir)
+
+
 def create_default_subagent_runner(
     tool_mgr: Optional[ToolManager] = None,
     workdir: Optional[Path] = None,
@@ -201,6 +213,7 @@ def create_default_tools(
     skill_loader: Optional[SkillLoader] = None,
     todo_mgr: Optional[TodoManager] = None,
     task_store: Optional[TaskStore] = None,
+    bg_mgr: Optional[BackgroundTaskManager] = None,
     subagent_runner: Optional[SubagentRunner] = None,
     shared_tool_mgr: Optional[ToolManager] = None,
 ) -> ToolManager:
@@ -209,6 +222,7 @@ def create_default_tools(
 
     在 `shared_tools`（5 大核心工具 + `load_skill` + `todo_write`）基础上额外挂载父级专属工具：
         - 计划第二轨：`create_task`, `update_task`, `list_tasks`, `get_task`, `claim_task`, `complete_task`；
+        - 异步后台：升级支持 `run_in_background` 的 `run_shell`，并挂载 `check_bg_task`, `kill_bg_task`, `list_bg_tasks`；
         - 代理与控制：`compact`, `task`。
     """
     target_workdir = workdir or WORKDIR
@@ -221,8 +235,8 @@ def create_default_tools(
             todo_mgr=todo_mgr,
         )
     )
-    # Why: 从纯净 shared_tools 克隆出新容器再挂载父级工具（DAG 任务图 + compact + task），
-    # 既确保传入的 shared_tool_mgr 不被原地污染，也阻止一次性子代理触碰或篡改父级 DAG 任务图。
+    # Why: 从纯净 shared_tools 克隆出新容器再挂载父级工具（DAG + 后台 + compact + task），
+    # 既确保传入的 shared_tool_mgr 不被原地污染，也防止同步子代理误触父级图或启动长后台进程。
     manager = base_shared.clone()
 
     active_task_store = (
@@ -232,6 +246,15 @@ def create_default_tools(
     )
     register_task_tools(manager, active_task_store)
 
+    active_bg_mgr = (
+        bg_mgr
+        if bg_mgr is not None
+        else create_default_bg_manager(workdir=target_workdir)
+    )
+    register_background_tools(manager, active_bg_mgr)
+    # Why: 在工具集上保留所属后台管理器引用，使仅传入 tools 的主循环/单测也能精准注入该工作区的完成通知
+    setattr(manager, "_bg_manager", active_bg_mgr)
+
     @manager.register(
         name="compact",
         description="主动触发上下文压缩归档。将过往对话转存至 .agent/transcripts/ 转录文件，并裁剪冗余历史。",
@@ -240,8 +263,8 @@ def create_default_tools(
     def run_compact() -> str:
         return "已收到压缩请求。当前轮次工具执行完毕后，系统将立即触发上下文历史归档与裁剪！"
 
-    # Why: 若外部未传入 subagent_runner，则基于未混入 DAG 任务图与 compact/task 的 base_shared 构造，
-    # 保证默认派发的子代理工作在目标 workdir 且严格隔离父级控制权。
+    # Why: 若外部未传入 subagent_runner，则基于未混入父级控制与后台工具的 base_shared 构造，
+    # 保证默认派发的子代理工作在目标 workdir 且严格隔离父级权限。
     active_runner = (
         subagent_runner
         if subagent_runner is not None
@@ -271,6 +294,7 @@ parent_tools: ToolManager = create_default_tools(
     skill_loader=default_skill_loader,
     todo_mgr=default_todo_mgr,
     task_store=default_task_store,
+    bg_mgr=default_bg_manager,
     subagent_runner=default_subagent_runner,
     shared_tool_mgr=shared_tools,
 )
@@ -329,17 +353,18 @@ def run_agent_turn(
     todo_mgr: Optional[TodoManager] = None,
     compactor: Optional[ContextCompactor] = None,
     memory_mgr: Optional[MemoryManager] = None,
+    bg_mgr: Optional[BackgroundTaskManager] = None,
     planning_state: Optional[Dict[str, int]] = None,
     max_turns: Optional[int] = None,
     verbose: bool = True,
 ) -> str:
     """
-    执行一次用户输入触发的单 Agent 闭环（核心 `while True` 工具循环 + Hook + Skill + Todo + Context + Memory）。
+    执行一次用户输入触发的单 Agent 闭环（核心 `while True` 工具循环 + Hook + Skill + 双轨计划 + Context + Memory + Subagent + Background）。
 
     运行流程：
         1. 触发 `UserPromptSubmit` 切面并追加 `user` 消息；
         2. 会话启动前按需召回跨会话记忆并刷新顶部 `system` 提示词；
-        3. 每次调用大模型前执行 `ContextCompactor.prepare()` 四步压缩管线；
+        3. 每次调用大模型前注入已就绪的 `<task_notification>` 后台通知，并执行 `ContextCompactor.prepare()` 四步压缩管线；
         4. 调用大模型（携带 `tools.get_schemas()`），遇上下文超长异常则执行 `reactive_compact` 自愈重试；
         5. 若模型**未发起** `tool_calls`，触发 `Stop` 切面（若 `Stop` 返回强行续轮指令则注入并继续，
            否则提炼/整理跨会话记忆并返回最终文本）；
@@ -358,6 +383,7 @@ def run_agent_turn(
     :param todo_mgr: 可选外部 Todo 管理器（仅作语义标注；若需绑定工具请通过 `create_default_tools(..., todo_mgr=...)` 传入）。
     :param compactor: 可选上下文压缩器；默认使用绑定 `.agent/` 目录的 `default_compactor`。
     :param memory_mgr: 可选跨会话记忆管理器；使用默认 `call_llm` 时默认启用 `default_memory_mgr`。
+    :param bg_mgr: 可选异步后台任务管理器；未传时优先复用 `tools` 关联的后台管理器，否则回退 `default_bg_manager`。
     :param planning_state: 可选的连续未规划计数字典 `{"rounds_since_planning": int}`；
         传入自定义 `messages` 时默认隔离新建，未传 `messages` 时默认使用模块级计数器。
     :param max_turns: 单次用户提问最多允许的模型调用轮数，默认取 `MAX_AGENT_TURNS`。
@@ -371,6 +397,11 @@ def run_agent_turn(
     active_tools = tools if tools is not None else default_tools
     active_hooks = hooks if hooks is not None else default_hooks
     active_compactor = compactor if compactor is not None else default_compactor
+    active_bg_mgr = (
+        bg_mgr
+        if bg_mgr is not None
+        else (getattr(active_tools, "_bg_manager", None) or default_bg_manager)
+    )
     # Why: 当外部传入自定义 Mock llm_caller（离线单测或 Demo）且未显式传入 memory_mgr 时，
     # 跳过默认记忆管理器，防止离线测试向真实大模型发起网络请求或写入当前仓库 .agent/memory/。
     active_memory: Optional[MemoryManager]
@@ -422,7 +453,8 @@ def run_agent_turn(
                 active_hooks.trigger(HookEvent.STOP, active_messages)
                 return limit_msg
 
-            # 3. 执行四步上下文压缩管线（使用切片原地替换，确保调用方持有的列表引用同步更新）
+            # 3. 每次调用大模型前先注入已完成的后台任务通知，再执行四步上下文压缩管线
+            active_bg_mgr.inject_notifications(active_messages)
             prepared = active_compactor.prepare(active_messages, active_request=active_user_request)
             if prepared is not active_messages:
                 active_messages[:] = prepared
